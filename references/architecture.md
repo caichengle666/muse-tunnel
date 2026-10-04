@@ -113,6 +113,20 @@ python3 -m unittest discover -s tests -v
 另有依赖层一组（`tests/test_deps.py`）：代理 URL 解析与脱敏、代理探活与 SOCKS 拒绝、
 经代理 CONNECT 到边缘、死环境变量回退到项目里的可用代理、required/optional 归类、
 各项自愈动作、启动顺序与就绪等待。测试用本地 TCP 桩冒充沙盒代理，不联网、不碰 /etc。
+
+大流量用例有两条硬要求，写测试时容易踩：
+
+- **收发必须并发**。「先把 payload 发完再读对端」等于要求内核缓冲吞下整个 payload，
+  在不同平台上会给出不同结论（Windows 回环缓冲自动调优得更大，于是本机假绿、Linux 上死锁）。
+  所以 `_pump_both_ways()` 用两个线程同时读和写。
+- **缓冲要压小**。仅靠默认缓冲，某些平台能一口吞下多兆字节，把「根本不排水」的 splice 掩盖掉。
+  `test_backpressure_with_cramped_kernel_buffers` 显式把 `SO_SNDBUF`/`SO_RCVBUF` 设到 16 KiB
+  再穿 1 MiB，并断言 `getsockopt` 确实生效，否则用例会因「缓冲其实很大」而空过。
+
+文件权限类断言（`secrets/` 目录 0700 等）是 POSIX-only，在 Windows 上按 `skipIf(os.name == "nt")`
+跳过，实际校验交给 CI 的 Linux runner。仓库用 `.gitattributes`(`* text=auto eol=lf`) 锁定 LF：
+这项目只在 Linux 跑，hook 脚本或 systemd 单元带 CRLF 会直接坏掉。
+
 CI（`.github/workflows/ci.yml`）在 3.10/3.12/3.13 上跑这套测试，外加 hook 模板的 `bash -n`
 与「模板占位符白名单」检查。
 

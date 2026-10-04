@@ -187,6 +187,36 @@ class SecretTests(unittest.TestCase):
             cfbridge.write_private(path, "v")
             self.assertFalse(os.path.exists(path + ".tmp"))
 
+    @unittest.skipIf(os.name == "nt", "POSIX directory modes only")
+    def test_write_private_does_not_rechmod_an_existing_directory(self):
+        """Only a directory this call creates is locked down.
+
+        Silently re-perming a pre-existing directory would be a nasty
+        side effect: write_private is also used for paths whose parent
+        belongs to someone else.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            shared = os.path.join(tmp, "shared")
+            os.makedirs(shared, 0o755)
+            os.chmod(shared, 0o755)
+            cfbridge.write_private(os.path.join(shared, "k"), "v")
+            self.assertEqual(stat.S_IMODE(os.stat(shared).st_mode), 0o755)
+
+    @unittest.skipIf(os.name == "nt", "POSIX directory modes only")
+    def test_write_private_dir_mode_none_opts_out(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rel = os.path.join(tmp, "loose")
+            cfbridge.write_private(os.path.join(rel, "k"), "v", 0o600, dir_mode=None)
+            self.assertNotEqual(stat.S_IMODE(os.stat(rel).st_mode) & 0o077, 0)
+
+    @unittest.skipIf(os.name == "nt", "POSIX directory modes only")
+    def test_write_secret_locks_the_secrets_directory(self):
+        with tempfile.TemporaryDirectory() as proj:
+            cfbridge.write_secret(proj, "bridge-key.txt", "k")
+            secrets = os.path.join(proj, "secrets")
+            self.assertEqual(stat.S_IMODE(os.stat(secrets).st_mode), 0o700)
+            self.assertEqual(stat.S_IMODE(os.stat(os.path.join(secrets, "bridge-key.txt")).st_mode), 0o600)
+
     def test_write_secret_strips_and_newlines(self):
         with tempfile.TemporaryDirectory() as proj:
             cfbridge.write_secret(proj, "tunnel-id.txt", "  abc123  ")

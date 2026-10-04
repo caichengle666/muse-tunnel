@@ -127,17 +127,30 @@ def save_config(proj: str, cfg: dict) -> None:
     os.replace(tmp, os.path.join(proj, "config.json"))
 
 
-def write_private(path: str, content: str, mode: int = 0o600) -> None:
+def write_private(path: str, content: str, mode: int = 0o600,
+                  dir_mode: int | None = 0o700) -> None:
     """Create/overwrite a file that must never be world-readable.
 
     os.open() applies the mode at creation time, so there is no window
     during which the file exists with looser permissions (a plain
     open()+chmod() leaves exactly that gap). Writes go through a temp
     file plus rename so a crash cannot leave a half-written secret.
+
+    A 0600 file inside a world-listable directory still leaks names and
+    metadata, so when this function has to create the containing
+    directory it locks that directory to `dir_mode` (default 0700).
+    Directories that already exist are left alone — they belong to
+    someone else to manage. Pass dir_mode=None to opt out entirely.
     """
     d = os.path.dirname(path)
     if d:
+        created = not os.path.isdir(d)
         os.makedirs(d, exist_ok=True)
+        if created and dir_mode is not None:
+            try:
+                os.chmod(d, dir_mode)
+            except OSError:
+                pass
     tmp = path + ".tmp"
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
     try:
@@ -1763,10 +1776,12 @@ def cmd_install_autostart(args) -> None:
     slug = project_slug(proj)
     hook_id = f"cfb-{slug}-keepalive"
     script_path = os.path.expanduser(f"~/hooks/scripts/{hook_id}.sh")
-    os.makedirs(os.path.dirname(script_path), exist_ok=True)
     text = render(read_template("keepalive-hook.sh.tmpl"),
                   {"PROJECT_DIR": proj, "SKILL_BIN": HERE})
-    write_private(script_path, text, 0o750)
+    # dir_mode=None: ~/hooks/scripts is a shared, non-secret directory
+    # owned by the hook runner, which may not be this user; leave its
+    # permissions to the system umask as before.
+    write_private(script_path, text, 0o750, dir_mode=None)
     print(f"hook script written: {script_path}")
     if not shutil.which("jq"):
         print("note: jq is not on PATH; the hook falls back to python3 for config parsing "

@@ -169,34 +169,112 @@ class SpliceTests(unittest.TestCase):
         self.addCleanup(cleanup)
         return t
 
+    def _cramped_pair(self):
+        """A socketpair whose kernel buffers cannot swallow the payload.
+
+        Default loopback buffers are large enough on some platforms
+        (notably Windows, which auto-tunes them) to absorb a whole
+        multi-megabyte payload, which hides a splice that never drains.
+        Shrinking them forces the backpressure path on every host, so
+        these tests do not depend on the platform's buffer autotuning.
+        """
+        a, b = self._pair()
+        for s in (a, b):
+            for opt in (socket.SO_SNDBUF, socket.SO_RCVBUF):
+                try:
+                    s.setsockopt(socket.SOL_SOCKET, opt, 16384)
+                except OSError:
+                    pass
+        return a, b
+
+    def _pump_both_ways(self, c2, u2, payload):
+        """Push `payload` in at c2 while concurrently draining u2.
+
+        Returns (received, errors, still-running-thread-names). The
+        concurrency is the point: draining only after the send finished
+        would require the kernel buffers to hold the entire payload.
+        """
+        received = bytearray()
+        errors: list[str] = []
+
+        def send_down():
+            try:
+                c2.sendall(payload)
+                c2.shutdown(socket.SHUT_WR)
+            except OSError as e:  # noqa: BLE001 - surfaced as a test failure
+                errors.append(f"send: {type(e).__name__}: {e}")
+
+        def recv_down():
+            try:
+                u2.settimeout(30)
+                while len(received) < len(payload):
+                    chunk = u2.recv(65536)
+                    if not chunk:
+                        break
+                    received.extend(chunk)
+            except OSError as e:  # noqa: BLE001
+                errors.append(f"recv: {type(e).__name__}: {e}")
+
+        threads = [threading.Thread(target=send_down), threading.Thread(target=recv_down)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=60)
+        return bytes(received), errors, [t.name for t in threads if t.is_alive()]
+
+    def _assert_transfer_ok(self, received, errors, stalled, payload, what):
+        self.assertEqual(errors, [], f"{what}: splice failed mid-transfer ({errors}, stalled: {stalled})")
+        self.assertEqual(stalled, [], f"{what}: stalled — splice is not draining")
+        self.assertEqual(len(received), len(payload), f"{what}: short read")
+        self.assertEqual(received, payload, f"{what}: payload corrupted")
+
     def test_bidirectional_bulk_transfer(self):
+        """2 MiB must cross while the far end is still draining.
+
+        An earlier version of this test sent the whole payload before
+        reading anything, which silently assumed the kernel buffers
+        could absorb 2 MiB; on Linux they cannot, so the test deadlocked
+        in sendall() while a perfectly healthy splice was applying
+        backpressure.
+        """
         c1, c2 = self._pair()
         u1, u2 = self._pair()
         self.addCleanup(lambda: [s.close() for s in (c1, c2, u1, u2)])
         self._splice_async(c1, u1)
 
         payload = os.urandom(2 * 1024 * 1024)
-        received = bytearray()
+        self._assert_transfer_ok(*self._pump_both_ways(c2, u2, payload),
+                                 payload=payload, what="bulk transfer")
 
-        def pump():
-            c2.sendall(payload)
-            u2.settimeout(20)
-            while len(received) < len(payload):
-                chunk = u2.recv(65536)
-                if not chunk:
-                    break
-                received.extend(chunk)
-
-        sender = threading.Thread(target=pump)
-        sender.start()
-        sender.join(timeout=60)
-        self.assertFalse(sender.is_alive(), "bulk transfer stalled — splice is not draining")
-        self.assertEqual(bytes(received), payload)
-
-        # And back the other way on the same spliced pair.
+        # And back the other way on the same spliced pair. The client's
+        # write side is already closed, so this also proves the FIN was
+        # forwarded as a half-close rather than tearing the pair down.
         u2.sendall(payload[:1024])
         c2.settimeout(10)
         self.assertEqual(c2.recv(4096), payload[:1024])
+
+    def test_backpressure_with_cramped_kernel_buffers(self):
+        """1 MiB through ~16 KiB buffers: the drain path must keep up.
+
+        This is the regression guard for the original defect. With
+        buffers this small a splice that stops reading its source while
+        the peer's send queue is full — or that never flushes the
+        pending buffer it wrote into — cannot move 1 MiB, and the
+        transfer times out instead of passing.
+        """
+        c1, c2 = self._cramped_pair()
+        u1, u2 = self._cramped_pair()
+        self.addCleanup(lambda: [s.close() for s in (c1, c2, u1, u2)])
+        self._splice_async(c1, u1)
+
+        # If the host silently ignored the small-buffer request this test
+        # would pass for the wrong reason, so prove the buffers really
+        # are small compared to what we push through them.
+        self.assertLess(c1.getsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF), 256 * 1024)
+
+        payload = os.urandom(1024 * 1024)
+        self._assert_transfer_ok(*self._pump_both_ways(c2, u2, payload),
+                                 payload=payload, what="cramped-buffer transfer")
 
     def test_input_prefix_is_flushed_to_the_client(self):
         """Bytes captured with the CONNECT response must reach cloudflared."""

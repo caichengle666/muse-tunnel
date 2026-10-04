@@ -1,0 +1,6 @@
+# This skill only ever runs on Linux (systemd units, a bash keepalive
+# hook, python3). Keep LF in the repository regardless of the platform a
+# contributor edits on: a CRLF hook script fails at
+# "/bin/bash^M: bad interpreter" and CRLF systemd units are equally
+# unhappy.
+* text=auto eol=lf

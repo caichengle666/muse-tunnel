@@ -1,5 +1,44 @@
 # CHANGELOG
 
+## 未发布 — CI 首跑修复（Linux 上暴露的两个问题）
+
+上一批改动推上去后 CI 在 3.10/3.12/3.13 上全红。查下来是两个独立问题，其中一个是真回归。
+
+### 修回归：`write_private()` 没有锁父目录权限
+
+`write_private()` 用 `os.open(..., mode)` 保证文件本体无权限空窗，但只 `os.makedirs()` 建父目录、
+不再 `chmod`，于是新建的 `secrets/` 是 `0755` 而不是 `0700`——原版 `write_secret()` 是显式
+`chmod(d, 0o700)` 的。文件本身仍 600，但目录可被列举，等于泄露了密钥文件名与元数据。
+
+现在 `write_private()` 新增 `dir_mode` 参数（默认 `0o700`），**当且仅当这次调用需要自己创建父目录时**
+才锁权限；已存在的目录不动（它不归这里管），传 `dir_mode=None` 可完全退出该行为。
+`~/hooks/scripts/` 那处显式传 `None` 保持原语义——那是 hook runner 可能以其他用户身份访问的
+共享目录，不该被收紧。
+
+真实运行时 `secrets/` 一直是对的（`write_secret` / `refresh_proxy_env` / `ensure_project_layout`
+各自都 chmod 过），但这个不变量不该靠每个调用方记得写，收敛进 `write_private` 更稳。
+
+### 修测试：`test_bidirectional_bulk_transfer` 自身设计有死锁
+
+不是 splice 的问题，是测试对内核缓冲做了错误假设：它先 `c2.sendall(2 MiB)` **全部发完**才去读
+`u2`，等于要求内核缓冲能吞下整个 payload。Linux 上不能（CI 上卡在 `sendall` 直到 join 超时），
+Windows 上能——因为 Windows 回环缓冲自动调得更大，所以本机一直「假绿」。
+
+改成**边发边收**（发送与接收各一个线程并发），这才是真正压到排水路径的写法；并抽出
+`_pump_both_ways()` 复用。
+
+### 新增测试：`test_backpressure_with_cramped_kernel_buffers`
+
+为了让这个用例不再依赖宿主的缓冲自动调优，新用例把 socket 的 `SO_SNDBUF`/`SO_RCVBUF` 显式压到
+16 KiB，再用 1 MiB payload 穿过去，并断言 `getsockopt` 确实生效（否则用例会因为「缓冲其实很大」
+而空过）。已实测该用例的有效性：把旧的「取错待写缓冲」缺陷注回去，它报 `recv TimeoutError`、
+0 字节而失败；当前代码则 1 MiB 完整送达。
+
+### 新增：`.gitattributes`
+
+`* text=auto eol=lf`。这项目只在 Linux 跑，hook 脚本带 CRLF 会直接
+`/bin/bash^M: bad interpreter`，systemd 单元同理。锁定仓库内换行符，避免 Windows 端编辑引入 CRLF。
+
 ## 未发布 — 依赖自己体检、自己补
 
 背景：这套东西的依赖过去只被「看一眼环境变量」就算检查过了——`HTTPS_PROXY` 存在即算代理可用

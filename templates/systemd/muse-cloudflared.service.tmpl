@@ -1,0 +1,23 @@
+# cf-tunnel-bridge canonical unit — rendered copy lives in the project
+# dir (persistent); installed to /etc/systemd/system/ by cfbridge up.
+# The tunnel token is read from secrets/tunnel-token.txt via
+# --token-file (600); it never appears in process args or logs.
+# TUNNEL_EDGE is only set when the doctor verdict is bridge-required.
+[Unit]
+Description=Cloudflare named tunnel ({{TUNNEL_NAME}}) via cf-tunnel-bridge
+After=network-online.target {{BRIDGE_UNIT_DEP}}
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory={{PROJECT_DIR}}
+{{TUNNEL_EDGE_ENV}}
+ExecStart={{PROJECT_DIR}}/bin/cloudflared tunnel --protocol http2 --no-autoupdate run --token-file {{PROJECT_DIR}}/secrets/tunnel-token.txt
+Restart=always
+RestartSec=10
+StandardOutput=append:{{PROJECT_DIR}}/logs/cloudflared.log
+StandardError=append:{{PROJECT_DIR}}/logs/cloudflared.log
+
+[Install]
+WantedBy=multi-user.target

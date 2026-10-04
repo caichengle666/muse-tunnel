@@ -1,0 +1,23 @@
+# cf-tunnel-bridge canonical unit for one registered service —
+# rendered copy lives in the project dir (persistent); installed to
+# /etc/systemd/system/ by cfbridge up. Only rendered when the service
+# declares a start_cmd; services already running on their port are
+# routed to, not managed.
+[Unit]
+Description=cf-tunnel-bridge service {{SERVICE_NAME}} ({{SERVICE_HOSTNAME}} -> 127.0.0.1:{{SERVICE_PORT}})
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory={{SERVICE_WORKDIR}}
+{{SERVICE_ENVFILE}}
+ExecStart={{SERVICE_START_CMD}}
+Restart=always
+RestartSec=5
+StandardOutput=append:{{PROJECT_DIR}}/logs/svc-{{SERVICE_NAME}}.log
+StandardError=append:{{PROJECT_DIR}}/logs/svc-{{SERVICE_NAME}}.log
+
+[Install]
+WantedBy=multi-user.target

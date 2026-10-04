@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+
+# cfbridge *deployment project* runtime state (never part of the skill repo;
+# anchored to a project root — skill files under templates/ are unaffected)
+/secrets/
+/venv/
+/logs/
+/run/
+/bin/cloudflared
+/config.json
+/services/
+/systemd/

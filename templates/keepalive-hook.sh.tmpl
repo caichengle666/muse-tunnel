@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+# cf-tunnel-keepalive hook (rendered by cfbridge install-autostart).
+# Keeps the cf-tunnel-bridge stack of ONE project alive:
+#   - all managed units active + first service health ok -> silent
+#   - otherwise reinstall units from the project's persistent systemd/
+#     copies (container rebuilds wipe /etc) and restart the stack
+#   - still unhealthy -> wake the agent, throttled to once per 30 min
+# proxy.env is refreshed from the current environment each poll: if
+# the sandbox proxy rotates, services follow. Credentials are written
+# only into secrets/proxy.env (600), never logged.
+set -euo pipefail
+source "$HATCH_HOOK_RUNTIME"
+
+PROJ="{{PROJECT_DIR}}"
+CFG="$PROJ/config.json"
+UNITS_FILE="$PROJ/run/managed-units.txt"
+
+[[ -f "$CFG" ]] || { log "cf-tunnel: no config.json in project" '{}'; silent "project config missing"; }
+[[ -f "$UNITS_FILE" ]] || silent "no managed units recorded yet (run cfbridge up first)"
+
+mapfile -t UNITS < "$UNITS_FILE"
+[[ ${#UNITS[@]} -gt 0 ]] || silent "managed units list empty"
+
+# --- refresh proxy.env from env (contains proxy creds; 600 only) ---
+proxy_url="${HTTPS_PROXY:-${https_proxy:-}}"
+if [[ -n "$proxy_url" ]]; then
+  mkdir -p "$PROJ/secrets"
+  tmp_env="$PROJ/secrets/.proxy.env.tmp"
+  {
+    printf 'HTTPS_PROXY=%s\n' "$proxy_url"
+    printf 'https_proxy=%s\n' "$proxy_url"
+    [[ -n "${HTTP_PROXY:-}" ]] && printf 'HTTP_PROXY=%s\n' "$HTTP_PROXY"
+    [[ -n "${http_proxy:-}" ]] && printf 'http_proxy=%s\n' "$http_proxy"
+    [[ -n "${NO_PROXY:-}" ]] && printf 'NO_PROXY=%s\n' "$NO_PROXY"
+    [[ -n "${no_proxy:-}" ]] && printf 'no_proxy=%s\n' "$no_proxy"
+    true
+  } > "$tmp_env"
+  chmod 600 "$tmp_env"
+  if ! cmp -s "$tmp_env" "$PROJ/secrets/proxy.env" 2>/dev/null; then
+    mv -f "$tmp_env" "$PROJ/secrets/proxy.env"
+    log "cf-tunnel: proxy.env refreshed" '{}'
+  else
+    rm -f "$tmp_env"
+  fi
+fi
+
+first_health_port="$(jq -r '.services[0].port // empty' "$CFG")"
+first_health_path="$(jq -r '.services[0].health // "/health"' "$CFG")"
+
+healthy() {
+  local u
+  for u in "${UNITS[@]}"; do
+    systemctl is-active --quiet "$u" 2>/dev/null || return 1
+  done
+  if [[ -n "$first_health_port" ]]; then
+    curl --fail --silent --max-time 5 "http://127.0.0.1:${first_health_port}${first_health_path}" >/dev/null 2>&1 || return 1
+  fi
+  return 0
+}
+
+if healthy; then
+  silent "cf tunnel stack healthy (${#UNITS[@]} units active)"
+fi
+
+log "cf-tunnel: stack unhealthy, reinstalling units and restarting" '{}'
+for u in "${UNITS[@]}"; do
+  [[ -f "$PROJ/systemd/$u.service" ]] && cp -f "$PROJ/systemd/$u.service" "/etc/systemd/system/$u.service"
+  systemctl enable --quiet "$u" 2>/dev/null || true
+done
+systemctl daemon-reload
+systemctl restart "${UNITS[@]}" || true
+
+for i in $(seq 1 15); do
+  sleep 3
+  if healthy; then
+    log "cf-tunnel: stack recovered after reinstall" '{}'
+    silent "cf tunnel stack was unhealthy and has been reinstalled/restarted; healthy now"
+  fi
+done
+
+log "cf-tunnel: stack still unhealthy after reinstall attempt" '{}'
+now_s="$(date +%s)"
+last_wake="$(hook_state_get | jq -r '.last_wake_epoch // 0')"
+if [[ "$now_s" -gt 0 && $((now_s - last_wake)) -ge 1800 ]]; then
+  hook_state_set "$(jq -cn --argjson t "$now_s" '{last_wake_epoch: $t}')"
+  wake "cf tunnel stack unhealthy after auto-reinstall" "{\"project\":\"$PROJ\",\"action\":\"investigate cf-tunnel-bridge stack\"}"
+fi
+silent "cf tunnel stack still unhealthy after reinstall (wake throttled)"

@@ -1,0 +1,21 @@
+# cf-tunnel-bridge canonical unit — rendered copy lives in the project
+# dir (persistent); installed to /etc/systemd/system/ by cfbridge up.
+# Container rebuilds wipe /etc; the keepalive hook reinstalls from here.
+[Unit]
+Description=CF tunnel edge bridge (local CONNECT proxy to CF edge 7844)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory={{PROJECT_DIR}}
+EnvironmentFile={{PROJECT_DIR}}/secrets/proxy.env
+ExecStart=/usr/bin/python3 {{SKILL_BIN}}/edge_bridge.py --listen 127.0.0.1:{{BRIDGE_PORT}}
+Restart=always
+RestartSec=5
+StandardOutput=append:{{PROJECT_DIR}}/logs/bridge.log
+StandardError=append:{{PROJECT_DIR}}/logs/bridge.log
+
+[Install]
+WantedBy=multi-user.target

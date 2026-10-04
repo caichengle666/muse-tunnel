@@ -10,8 +10,11 @@ Wants=network-online.target
 Type=simple
 User=root
 WorkingDirectory={{PROJECT_DIR}}
-EnvironmentFile={{PROJECT_DIR}}/secrets/proxy.env
-ExecStart=/usr/bin/python3 {{SKILL_BIN}}/edge_bridge.py --listen 127.0.0.1:{{BRIDGE_PORT}}
+# "-" so a missing file does not make systemd refuse to start the unit:
+# the bridge reports the missing proxy itself, with a usable message,
+# and `cfbridge doctor --fix` rewrites the file from the live proxy.
+EnvironmentFile=-{{PROJECT_DIR}}/secrets/proxy.env
+ExecStart={{PYTHON}} {{SKILL_BIN}}/edge_bridge.py --listen 127.0.0.1:{{BRIDGE_PORT}}
 Restart=always
 RestartSec=5
 StandardOutput=append:{{PROJECT_DIR}}/logs/bridge.log

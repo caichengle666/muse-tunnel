@@ -6,7 +6,7 @@
 [Unit]
 Description=Cloudflare named tunnel ({{TUNNEL_NAME}}) via cf-tunnel-bridge
 After=network-online.target {{BRIDGE_UNIT_DEP}}
-Wants=network-online.target
+Wants=network-online.target {{BRIDGE_UNIT_DEP}}
 
 [Service]
 Type=simple

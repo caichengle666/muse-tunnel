@@ -29,13 +29,90 @@ cloudflared ──TUNNEL_EDGE──► edge_bridge.py ──代理 CONNECT──
 
 候选 edge 必须**并行竞速**：顺序试时单个死 IP 的 CONNECT 超时会吃光 cloudflared 约 15 秒的 TLS 握手预算，隧道永远注册不上，公网表现为持续 530/1033。这是实测踩出来的，不是理论推演。
 
+竞速失败后的处理：整轮没赢就重跑一次 DoH 再竞速（anycast 集合会轮换，缓存住的老 IP 会失效），
+60 秒内不重复解析，避免代理抖动时把 DoH 打爆。败者 socket 一律关闭，不留 fd。
+
+### 拼接（splice）的正确写法
+
+桥只做「字节搬运」，但搬法有讲究：
+
+- 两个方向都用非阻塞 socket + `select` 驱动，**每个方向各有一个待写缓冲**。
+  直接对非阻塞 socket 调 `sendall` 是错的：缓冲区满时它抛 `BlockingIOError`，
+  如果把它当致命错误处理，健康连接会在流量一大就被无声掐断；如果不管，数据就丢了。
+- 背压：某方向的待写缓冲没清空前，暂停读它对面那个 socket，避免内存无限涨。
+- 半关闭要双向透传：读到 EOF 后先把欠对方的字节写完，再 `shutdown(SHUT_WR)`，
+  不能直接 close（否则 FIN 丢失，cloudflared 侧看不到对端结束）。
+- 空闲看门狗：既覆盖「双方都静默」（隧道空闲），也覆盖「select 一直报可写但一个字节都没动」
+  这类病态自旋——判据是「最近一次真正搬动字节的时间」，不是「select 是否返回空」。
+- CONNECT 响应里若捎带了隧道数据（同一读里跟在响应头后面的字节），
+  这些字节作为 `prefix` 交给拼接先发给 cloudflared；不这么做它们会永久留在缓冲区里。
+
+## 依赖关系（谁必须先在）
+
+```
+proxy (沙盒共享代理, secrets/proxy.env 是 unit 唯一的来源)
+  ├─► DoH cloudflare-dns.com ─► 真 edge IP 候选
+  └─► edge_bridge (CONNECT 到 edge:7844)
+        └─► cloudflared (TUNNEL_EDGE 指桥, 直到日志出现 Registered)
+              └─► ingress hostname -> origin
+                    └─► 服务 unit (可能依赖项目 venv)
+```
+
+两个含义：
+
+1. **启动必须按这个顺序，而且要等上一层就绪**。桥没在监听就把 cloudflared 拉起来，只会让它
+   第一轮握手失败再退避重试；cloudflared「进程 active」也远不等于隧道注册上了——判据是
+   日志里出现 `Registered tunnel connection`（且必须是本次重启之后的，日志是追加写的，
+   旧记录会让新进程瞬间「看起来很健康」）。`start_stack()` 就是按这个顺序做并逐层等待的。
+   同理，`muse-cloudflared.service` 对桥同时声明 `After=` 与 `Wants=`：单独 restart
+   cloudflared 时桥会被一起拉起来，而不是留一个「依赖没起」的假启动。
+2. **缺哪一层都会以完全不同的症状暴露**。代理死了表现为 `all edge candidates failed`；
+   桥端口被占表现为桥 unit 反复重启；venv 丢了表现为服务 unit 反复重启；`proxy.env` 丢了
+   表现为桥 unit 起不来。`collect_deps()` 就是把这些一次性探明，`heal_deps()` 负责补工具
+   自己能补的那部分。
+
 ## 持久化与自恢复（三层）
 
 - 只有家目录 `/home/hatch` 是持久卷；系统目录（/etc、/usr）随容器重建丢失。所以一切源头放项目目录：config、secrets、systemd 规范副本、cloudflared 二进制副本、venv、hook 脚本。
 - 第一层：systemd `Restart=always`，单进程崩了自己拉。
 - 第二层：单元规范副本在项目 `systemd/`，`/etc` 里的只是安装件。
-- 第三层：Muse hook（`install-autostart` 渲染）每 60 秒巡检；发现单元缺失/不健康就从规范副本重装并整套重启；沙盒重建后 hook 定义还在，第一轮巡检（约 1 分钟内）即恢复。修不好时节流 wake agent（30 分钟一次）。
+- 第三层：Muse hook（`install-autostart` 渲染）每 60 秒巡检；发现单元缺失/不健康就从规范副本重装并整套重启；沙盒重建后 hook 定义还在，第一轮巡检（约 1 分钟内）即恢复。hook 自己修不动时（venv 丢、cloudflared 副本坏、代理轮换、桥端口被占）会再调一次 `doctor --fix`，把依赖层也补齐；仍不行才节流 wake agent（30 分钟一次）。
 
 ## 与官方命名的关系
 
 Tunnel 前身是 Argo Tunnel，所以 CNAME 目标仍是 `<id>.cfargotunnel.com`、edge 主机名仍是 `region*.v2.argotunnel.com`。与现在另售的 Argo Smart Routing（付费加速）无关，本方案没有也不需要它。
+
+## 信任边界与安全姿态
+
+- **桥不解密**：TLS 由 cloudflared 与 edge 端到端完成，桥只搬裸 TCP 字节，看不到隧道内容与凭据。
+- **代理凭据**只从环境读、只用于 CONNECT 握手，不进日志；写进项目时是 `secrets/proxy.env`（600）。
+- **隧道令牌**经 `--token-file` 传给 cloudflared，不出现在进程参数里（`ps` 看不到），落盘 600。
+- **共享密钥**只走 `X-Bridge-Key` 请求头；不要放进 URL query（query 会进 Cloudflare 与源站访问日志）。
+  `verify` 按此实现，并且会额外验一次「不带密钥必须被拒」。
+- **DNS 归属**：本工具建的记录带 `cf-tunnel-bridge managed` 注释。`up` 只改写自己建的、
+  或已指向本隧道的记录，遇到他人的记录直接报错停下；`teardown` 同理只删自己的那份。
+  这是为了不让一条隧道的生命周期误伤同 zone 下别人正在用的域名。
+- **落地文件的权限**：所有密钥用 `os.open(..., 0o600)` 在创建时就定权，不存在
+  「先按默认 umask 建、再 chmod」的空窗；写入走临时文件 + `rename`，崩溃不会留下半截密钥。
+- **模板渲染**：占位符未解析就报错停下；代入值含换行也直接拒绝——否则一个配置字段就能往
+  systemd unit 里注入任意指令。
+- **二进制来源**：cloudflared 默认锁定版本下载（可用 `CFBRIDGE_CLOUDFLARED_SHA256` 强制校验和）。
+  Cloudflare 不发布逐资产校验和文件，所以默认只做「体积 + ELF 魔数 + 实际能跑出版本号」三重本地校验。
+
+## 测试
+
+`tests/` 是纯标准库 unittest，不需要 root、不联网、可在任意平台跑：
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+覆盖桥的 CONNECT 解析与前缀字节、拼接的双向大流量/半关闭/空闲超时/对端突关、
+边缘竞速的胜者与败者回收、DNS 归属保护、ingress origin、API 重试退避、
+注册表校验（zone 边界、换行注入、public 确认）、模板渲染与 unit 命名唯一性。
+另有依赖层一组（`tests/test_deps.py`）：代理 URL 解析与脱敏、代理探活与 SOCKS 拒绝、
+经代理 CONNECT 到边缘、死环境变量回退到项目里的可用代理、required/optional 归类、
+各项自愈动作、启动顺序与就绪等待。测试用本地 TCP 桩冒充沙盒代理，不联网、不碰 /etc。
+CI（`.github/workflows/ci.yml`）在 3.10/3.12/3.13 上跑这套测试，外加 hook 模板的 `bash -n`
+与「模板占位符白名单」检查。
+

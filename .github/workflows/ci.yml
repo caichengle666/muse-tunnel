@@ -1,0 +1,57 @@
+name: ci
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      # The tool is stdlib-only by design; nothing to install.
+      - name: Byte-compile
+        run: python -m compileall -q bin tests
+
+      - name: Unit tests
+        run: python -W ignore::ResourceWarning -m unittest discover -s tests -v
+
+      - name: Help output smoke test
+        run: |
+          python bin/cfbridge.py --help >/dev/null
+          python bin/edge_bridge.py --help >/dev/null
+          python bin/cf_api.py --help 2>/dev/null || true
+
+      - name: Shell syntax of the rendered hook template
+        run: bash -n templates/keepalive-hook.sh.tmpl
+
+      - name: Templates keep every placeholder resolvable
+        run: |
+          python - <<'PY'
+          import re, sys, pathlib
+          sys.path.insert(0, "bin")
+          import cfbridge
+          # Every {{PLACEHOLDER}} in a template must be one a renderer supplies.
+          supplied = {"PROJECT_DIR", "SKILL_BIN", "PYTHON", "BRIDGE_PORT", "TUNNEL_NAME",
+                      "BRIDGE_UNIT_DEP", "TUNNEL_EDGE_ENV", "SERVICE_NAME", "SERVICE_HOSTNAME",
+                      "SERVICE_PORT", "SERVICE_WORKDIR", "SERVICE_START_CMD", "SERVICE_ENVFILE"}
+          bad = []
+          for path in pathlib.Path("templates").rglob("*"):
+              if not path.is_file():
+                  continue
+              for name in set(re.findall(r"\{\{([A-Za-z0-9_]+)\}\}", path.read_text(encoding="utf-8"))):
+                  if name not in supplied:
+                      bad.append(f"{path}: unknown placeholder {name}")
+          print("\n".join(bad) or "all placeholders known")
+          sys.exit(1 if bad else 0)
+          PY

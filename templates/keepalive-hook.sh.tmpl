@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # cf-tunnel-keepalive hook (rendered by cfbridge install-autostart).
 # Keeps the cf-tunnel-bridge stack of ONE project alive:
-#   - all managed units active + first service health ok -> silent
+#   - all managed units active + every service health ok -> silent
 #   - otherwise reinstall units from the project's persistent systemd/
 #     copies (container rebuilds wipe /etc) and restart the stack
 #   - still unhealthy -> wake the agent, throttled to once per 30 min
@@ -14,6 +14,7 @@ source "$HATCH_HOOK_RUNTIME"
 PROJ="{{PROJECT_DIR}}"
 CFG="$PROJ/config.json"
 UNITS_FILE="$PROJ/run/managed-units.txt"
+CANON_DIR="$PROJ/systemd"
 
 [[ -f "$CFG" ]] || { log "cf-tunnel: no config.json in project" '{}'; silent "project config missing"; }
 [[ -f "$UNITS_FILE" ]] || silent "no managed units recorded yet (run cfbridge up first)"
@@ -21,10 +22,14 @@ UNITS_FILE="$PROJ/run/managed-units.txt"
 mapfile -t UNITS < "$UNITS_FILE"
 [[ ${#UNITS[@]} -gt 0 ]] || silent "managed units list empty"
 
+# Recreate anything a container rebuild may have dropped. Without this
+# the unit reinstall below has nothing to read from.
+mkdir -p "$PROJ/logs" "$PROJ/run" "$PROJ/secrets"
+chmod 700 "$PROJ/secrets" 2>/dev/null || true
+
 # --- refresh proxy.env from env (contains proxy creds; 600 only) ---
 proxy_url="${HTTPS_PROXY:-${https_proxy:-}}"
 if [[ -n "$proxy_url" ]]; then
-  mkdir -p "$PROJ/secrets"
   tmp_env="$PROJ/secrets/.proxy.env.tmp"
   {
     printf 'HTTPS_PROXY=%s\n' "$proxy_url"
@@ -44,45 +49,121 @@ if [[ -n "$proxy_url" ]]; then
   fi
 fi
 
-first_health_port="$(jq -r '.services[0].port // empty' "$CFG")"
-first_health_path="$(jq -r '.services[0].health // "/health"' "$CFG")"
+# --- service health list: "port<TAB>path" per service ---
+# python3 is guaranteed present (the stack runs on it); jq is only a
+# fallback, so the config parse works without either.
+svc_list() {
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - "$CFG" <<'PY'
+import json, sys
+try:
+    with open(sys.argv[1], encoding="utf-8") as f:
+        cfg = json.load(f)
+except Exception:
+    sys.exit(0)
+for s in cfg.get("services") or []:
+    port = s.get("port")
+    if not port:
+        continue
+    print(f"{port}\t{s.get('health') or '/health'}")
+PY
+  elif command -v jq >/dev/null 2>&1; then
+    jq -r '.services[]? | "\(.port)\t\(.health // "/health")"' "$CFG" 2>/dev/null || true
+  fi
+}
+
+mapfile -t SVCS < <(svc_list || true)
 
 healthy() {
-  local u
+  local u port path line
   for u in "${UNITS[@]}"; do
     systemctl is-active --quiet "$u" 2>/dev/null || return 1
   done
-  if [[ -n "$first_health_port" ]]; then
-    curl --fail --silent --max-time 5 "http://127.0.0.1:${first_health_port}${first_health_path}" >/dev/null 2>&1 || return 1
-  fi
+  # Every service must answer, not just the first one: otherwise a dead
+  # second service stays dead while the hook keeps reporting healthy.
+  for line in "${SVCS[@]}"; do
+    [[ -n "$line" ]] || continue
+    port="${line%%$'\t'*}"
+    path="${line#*$'\t'}"
+    [[ -n "$port" ]] || continue
+    curl --fail --silent --max-time 5 "http://127.0.0.1:${port}${path}" >/dev/null 2>&1 || return 1
+  done
   return 0
 }
 
 if healthy; then
-  silent "cf tunnel stack healthy (${#UNITS[@]} units active)"
+  silent "cf tunnel stack healthy (${#UNITS[@]} units, ${#SVCS[@]} services)"
 fi
 
 log "cf-tunnel: stack unhealthy, reinstalling units and restarting" '{}'
+missing_canon=0
 for u in "${UNITS[@]}"; do
-  [[ -f "$PROJ/systemd/$u.service" ]] && cp -f "$PROJ/systemd/$u.service" "/etc/systemd/system/$u.service"
+  if [[ -f "$CANON_DIR/$u.service" ]]; then
+    cp -f "$CANON_DIR/$u.service" "/etc/systemd/system/$u.service"
+    chmod 644 "/etc/systemd/system/$u.service" 2>/dev/null || true
+  else
+    missing_canon=1
+  fi
   systemctl enable --quiet "$u" 2>/dev/null || true
 done
 systemctl daemon-reload
+systemctl reset-failed "${UNITS[@]}" 2>/dev/null || true
 systemctl restart "${UNITS[@]}" || true
 
-for i in $(seq 1 15); do
+recovered=0
+for _ in $(seq 1 15); do
   sleep 3
   if healthy; then
-    log "cf-tunnel: stack recovered after reinstall" '{}'
-    silent "cf tunnel stack was unhealthy and has been reinstalled/restarted; healthy now"
+    recovered=1
+    break
   fi
 done
+if [[ "$recovered" == "1" ]]; then
+  log "cf-tunnel: stack recovered after reinstall" '{}'
+  silent "cf tunnel stack was unhealthy and has been reinstalled/restarted; healthy now"
+fi
 
 log "cf-tunnel: stack still unhealthy after reinstall attempt" '{}'
-now_s="$(date +%s)"
-last_wake="$(hook_state_get | jq -r '.last_wake_epoch // 0')"
-if [[ "$now_s" -gt 0 && $((now_s - last_wake)) -ge 1800 ]]; then
-  hook_state_set "$(jq -cn --argjson t "$now_s" '{last_wake_epoch: $t}')"
-  wake "cf tunnel stack unhealthy after auto-reinstall" "{\"project\":\"$PROJ\",\"action\":\"investigate cf-tunnel-bridge stack\"}"
+if [[ "$missing_canon" == "1" ]]; then
+  log "cf-tunnel: canonical units missing under $CANON_DIR" '{}'
 fi
-silent "cf tunnel stack still unhealthy after reinstall (wake throttled)"
+
+# Last resort before waking the agent: let the CLI repair its own
+# dependencies. Reinstalling units only fixes a wiped /etc; a lost
+# venv, a missing cloudflared copy, a rotated proxy.env value or a
+# bridge port taken by another project all leave units installed and
+# crash-looping. doctor --fix covers those and starts what is down.
+CFB="{{SKILL_BIN}}/cfbridge.py"
+if [[ -f "$CFB" ]]; then
+  fix_log="$PROJ/logs/last-doctor-fix.log"
+  if python3 "$CFB" --project "$PROJ" doctor --fix >"$fix_log" 2>&1; then
+    :  # exit 0 = every required dependency is satisfied
+  else
+    # A non-zero exit still writes the full report; it just means some
+    # dependency is beyond repair from here (no root, no proxy, ...).
+    true
+  fi
+  if healthy; then
+    log "cf-tunnel: stack recovered via doctor --fix (see logs/last-doctor-fix.log)" '{}'
+    silent "cf tunnel stack was unhealthy; cfbridge doctor --fix repaired it"
+  fi
+fi
+
+# Wake throttling needs jq (hook_state_get returns JSON). Without it we
+# still wake, just without the throttle — better noisy than silent-dead.
+throttled=0
+if command -v jq >/dev/null 2>&1; then
+  now_s="$(date +%s)"
+  last_wake="$(hook_state_get | jq -r '.last_wake_epoch // 0' 2>/dev/null || echo 0)"
+  if [[ "$now_s" =~ ^[0-9]+$ ]] && [[ "$last_wake" =~ ^[0-9]+$ ]] && (( now_s - last_wake < 1800 )); then
+    throttled=1
+  else
+    hook_state_set "$(jq -cn --argjson t "$now_s" '{last_wake_epoch: $t}')" || true
+  fi
+fi
+if [[ "$throttled" == "1" ]]; then
+  silent "cf tunnel stack still unhealthy after reinstall (wake throttled)"
+fi
+wake "cf tunnel stack unhealthy after auto-reinstall" \
+     "{\"project\":\"$PROJ\",\"action\":\"investigate cf-tunnel-bridge stack\"}"
+silent "cf tunnel stack still unhealthy after reinstall; agent woken"

@@ -16,11 +16,13 @@ credentials are used for the CONNECT handshake and never logged.
 
 Real edge IPs are discovered over DoH (cloudflare-dns.com, which
 bypasses the poisoned system resolver); a built-in fallback list is
-used when DoH fails. Candidates are raced in parallel: sequentially
-trying them lets one dead edge eat cloudflared's ~15s TLS handshake
-budget and the tunnel never comes up. A total race failure triggers a
-fresh DoH round (the anycast set does rotate) before the client is
-dropped.
+used when DoH fails. Candidates are raced in parallel (race_connect):
+sequentially trying them lets one dead edge eat cloudflared's ~15s TLS
+handshake budget and the tunnel never comes up. cfbridge's dependency
+probe calls the same race_connect() — one implementation, so health
+checks cannot drift away from what the bridge actually does. A total
+race failure triggers a fresh DoH round (the anycast set does rotate)
+before the client is dropped.
 
 Usage:
     python3 edge_bridge.py [--listen 127.0.0.1:17844] [--race 8]
@@ -60,6 +62,13 @@ FALLBACK_EDGES = [
 # set does rotate, so a cached list can go stale under a long-lived unit.
 DOH_REFRESH_MIN_INTERVAL = 60.0
 IDLE_TIMEOUT_DEFAULT = 300.0
+
+# Defaults for one race round (see race_connect). They are constants
+# rather than literals because cfbridge's dependency probe races the
+# same way and must not drift from what the bridge actually does.
+RACE_WIDTH_DEFAULT = 8
+CONNECT_TIMEOUT_DEFAULT = 8.0
+RACE_TIMEOUT_DEFAULT = 12.0
 
 
 def log(msg: str) -> None:
@@ -159,6 +168,79 @@ def _shutdown_write(sock: socket.socket) -> None:
         pass
 
 
+def race_connect(candidates, proxy, race: int = RACE_WIDTH_DEFAULT,
+                 connect_timeout: float = CONNECT_TIMEOUT_DEFAULT,
+                 race_timeout: float = RACE_TIMEOUT_DEFAULT,
+                 ) -> tuple[str, socket.socket, bytes] | None:
+    """Dial the candidates concurrently through `proxy`; first CONNECT 200 wins.
+
+    Two properties matter, and both have been got wrong before:
+
+    * **Concurrency.** Trying the candidates one at a time lets a single
+      unresponsive edge hold its CONNECT for the whole connect_timeout,
+      which eats cloudflared's ~15s TLS handshake budget in the bridge —
+      and in a health probe makes a transient hiccup look like a broken
+      proxy.
+    * **Early failure.** Waiting out race_timeout even after every
+      attempt has already failed turns a clean "proxy answered 403" into
+      a pointless 12-second stall, so the wait ends as soon as either a
+      winner appears or the last attempt gives up.
+
+    The bridge and cfbridge's dependency probe share this function on
+    purpose: they used to carry separate copies of the logic and drifted,
+    which is exactly how the probe ended up trying candidates one by one
+    while the bridge raced them.
+    """
+    ips = [ip for ip in list(candidates)[:race] if ip]
+    if not ips:
+        return None
+
+    results: list[tuple[str, socket.socket, bytes]] = []
+    lock = threading.Lock()
+    settled = threading.Event()
+    pending = len(ips)
+
+    def attempt(ip: str) -> None:
+        nonlocal pending
+        got = connect_via_proxy(ip, connect_timeout, proxy)
+        try:
+            if got is None:
+                return
+            sock, prefix = got
+            with lock:
+                won = not settled.is_set()
+                if won:
+                    results.append((ip, sock, prefix))
+                    settled.set()
+            if not won:
+                # A loser finishing after the winner must not leak its fd.
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+        finally:
+            with lock:
+                pending -= 1
+                if pending <= 0:
+                    settled.set()   # everything failed: stop waiting now
+
+    threads = [threading.Thread(target=attempt, args=(ip,), daemon=True) for ip in ips]
+    for t in threads:
+        t.start()
+    settled.wait(timeout=race_timeout)
+    with lock:
+        picked = list(results)
+    if not picked:
+        return None
+    ip, winner, prefix = picked[0]
+    for _, s, _ in picked[1:]:
+        try:
+            s.close()
+        except OSError:
+            pass
+    return ip, winner, prefix
+
+
 def splice(a: socket.socket, b: socket.socket, prefix: bytes = b"",
            idle_timeout: float = IDLE_TIMEOUT_DEFAULT) -> None:
     """Splice two sockets byte-for-byte until both directions are done.
@@ -241,7 +323,9 @@ def splice(a: socket.socket, b: socket.socket, prefix: bytes = b"",
 
 
 class EdgeBridge:
-    def __init__(self, race: int = 8, connect_timeout: float = 8, race_timeout: float = 12,
+    def __init__(self, race: int = RACE_WIDTH_DEFAULT,
+                 connect_timeout: float = CONNECT_TIMEOUT_DEFAULT,
+                 race_timeout: float = RACE_TIMEOUT_DEFAULT,
                  idle_timeout: float = IDLE_TIMEOUT_DEFAULT):
         self.race = race
         self.connect_timeout = connect_timeout
@@ -264,50 +348,10 @@ class EdgeBridge:
             log(f"edge candidates refreshed via DoH: {len(ips)}")
 
     def race_edges(self) -> tuple[str, socket.socket, bytes] | None:
-        """Race several edge IPs; first CONNECT 200 wins.
-
-        Sequential trying is too slow: one dead edge holds the CONNECT
-        for the full timeout and starves cloudflared's TLS budget.
-        """
-        results: list[tuple[str, socket.socket, bytes]] = []
-        lock = threading.Lock()
-        done = threading.Event()
-
-        def attempt(ip: str) -> None:
-            got = connect_via_proxy(ip, timeout=self.connect_timeout, proxy=self.proxy)
-            if got is None:
-                return
-            s, prefix = got
-            with lock:
-                winner = done.is_set()
-                if not winner:
-                    results.append((ip, s, prefix))
-                    done.set()
-            if winner:
-                # A loser finishing after the winner must not leak its fd.
-                try:
-                    s.close()
-                except OSError:
-                    pass
-
-        threads = [
-            threading.Thread(target=attempt, args=(ip,), daemon=True)
-            for ip in list(self.edge_ips[: self.race])
-        ]
-        for t in threads:
-            t.start()
-        done.wait(timeout=self.race_timeout)
-        with lock:
-            picked = list(results)
-        if not picked:
-            return None
-        ip, winner, prefix = picked[0]
-        for _, s, _ in picked[1:]:
-            try:
-                s.close()
-            except OSError:
-                pass
-        return ip, winner, prefix
+        """Race several edge IPs; first CONNECT 200 wins."""
+        return race_connect(self.edge_ips, self.proxy, race=self.race,
+                            connect_timeout=self.connect_timeout,
+                            race_timeout=self.race_timeout)
 
     def handle(self, client: socket.socket) -> None:
         try:
@@ -362,9 +406,10 @@ def parse_listen(value: str) -> tuple[str, int]:
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="cloudflared edge bridge for proxied sandboxes")
     ap.add_argument("--listen", default=os.environ.get("CF_EDGE_BRIDGE_LISTEN", "127.0.0.1:17844"))
-    ap.add_argument("--race", type=int, default=8, help="edge candidates raced in parallel")
-    ap.add_argument("--connect-timeout", type=float, default=8)
-    ap.add_argument("--race-timeout", type=float, default=12)
+    ap.add_argument("--race", type=int, default=RACE_WIDTH_DEFAULT,
+                    help="edge candidates raced in parallel")
+    ap.add_argument("--connect-timeout", type=float, default=CONNECT_TIMEOUT_DEFAULT)
+    ap.add_argument("--race-timeout", type=float, default=RACE_TIMEOUT_DEFAULT)
     ap.add_argument("--idle-timeout", type=float, default=IDLE_TIMEOUT_DEFAULT,
                     help="drop a spliced pair after this many idle seconds")
     args = ap.parse_args(argv)

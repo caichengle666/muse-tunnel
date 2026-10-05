@@ -72,7 +72,7 @@ cloudflared 的 `originServerName` 为空时，用 **service URL 里的主机名
 | `proxy` | 是 | 环境或 `secrets/proxy.env` 里有一条**连得上**的 HTTP 代理（SOCKS 不算） |
 | `secrets/proxy.env` | 桥模式 | 桥 unit 唯一的代理来源；`--fix` 会重写 |
 | `bridge key` | 是 | `secrets/bridge-key.txt`；`--fix` 会生成新的（服务从该路径读取） |
-| `edge via proxy` / `direct edge` | 是 | 桥模式：经代理 CONNECT 到 edge:7844；direct 模式：验证证书的 TLS 握手 |
+| `edge via proxy` / `direct edge` | 是 | 桥模式：经代理 CONNECT 到 edge:7844；direct 模式：验证证书的 TLS 握手。两者都**并发竞速全部候选**（复用桥的 `race_connect`），前者失败还会再跑一轮才判 MISSING |
 | `doh edge lookup` | 否 | DoH 拿不到就退回内置候选列表，仍可用 |
 | `bridge port` | 桥模式 | 空闲，或正被本项目的桥占用（占用=正常） |
 | `service venv` | 仅当被引用 | 见上 |

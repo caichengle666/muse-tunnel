@@ -27,6 +27,8 @@
 | doctor 说 direct 但隧道仍不通 | cloudflared.log | 直连判定被透明代理骗了：裸 TCP 能连上、甚至未验证的 TLS 能握上，都可能是拦截器在应答，不算到真 edge | doctor 用“验证证书+ALPN 的 TLS 握手 + fake-IP 签名强制桥”判定；仍遇此象就在 config 设 `"mode": "bridge"` 强制走桥，再 `up` |
 | 改了服务却没生效 | `run/managed-units.txt` | unit 是 `up` 渲染的，手工改 config.json 后必须重跑 | 重跑 `up`（会重渲染、重装、清理已移除的旧 unit，再重启） |
 | `doctor` 退出码 1 / 看到 `dependencies:` 里有 `MISSING` | 那一行后面的 `detail` | 该依赖确实不可用（不是「环境变量没设」那么简单：代理要连得上 + 能 CONNECT 到边缘，cloudflared 要跑得起来） | 先 `doctor --fix` 让它自己补；补不掉的 `heal` 列会写清为什么（无 root / 无 systemd / 代理挂了），按那一条处理 |
+| `doctor` 报 `edge via proxy MISSING`、重跑（环境没变）却 ok | 两次输出里的 `detail` | 旧版本只按顺序试 3 个候选、一轮就下结论，共享出口上一次瞬时抖动就够了——典型的**假警报**，会让你去查一个没问题的代理 CONNECT 策略 | 已修：探针改为复用桥的 `race_connect()`（并发竞速）+ 失败重试一轮。若现在仍报 MISSING，那是两轮、全部候选都失败，`detail` 才可信；按 `heal` 列查代理对 7844 的 ACL |
+| 第一次 `doctor` 说 direct、第二次说 bridge（或反之） | `direct TLS 7844 (verified)` | 直连探针原先也是顺序试候选，单个不理人的 IP 就能翻转结论 | 已修：`direct_edge_ok` 并发拨候选，谁先验通证书算谁。反复翻转仍出现就查 `direct_ok` 两侧的日志/代理，别直接改 `mode` |
 | 代理轮换后全挂（env 里还是旧 URL） | `doctor` 的 `proxy` 行 | `HTTPS_PROXY` 指向的代理已经不可用 | `doctor --fix` 会去 `secrets/proxy.env` 里找仍在工作的那条并采用；都没有就 `export CFBRIDGE_PROXY=<新代理>` 再 `up` |
 | 桥 unit 起不来、日志空 | `systemctl status` 提示 `EnvironmentFile ... not found` | `secrets/proxy.env` 丢了（旧模板会把 unit 直接判失败） | 现在 unit 用 `EnvironmentFile=-` 不再硬失败；`doctor --fix` 会重写该文件（它是桥唯一拿代理的途径） |
 | 重启后服务 unit 反复重启、日志报 `No such file or directory: .../venv/bin/python` | `logs/svc-<name>.log` | 服务 venv 没建或被清（以前只有 `init` 会建） | `up` / `doctor --fix` 会自动重建 venv 并装 `websockets>=12,<16`；服务需要别的依赖就自己装进同一个 venv |
@@ -64,6 +66,12 @@ API 重试策略（幂等可重试、POST 只在 429 重试）、`ensure_tunnel`
 「环境里的代理死了但项目里那条还活着」的回退、依赖清单的 required/optional 归类、
 自愈动作（建目录与密钥、安装 cloudflared、顺延桥端口、重建 venv、重装被清的 unit、
 重启已失联的 cloudflared）、启动顺序、就绪等待（端口监听 / 日志里的注册标记必须晚于重启点）。
+其中专门有一组盯**探针的判定质量**：探测必须一次调用就带上全部候选（并发竞速，不是逐个试）、
+一轮失败要重试后再下结论、赢到的 socket 要关掉不泄漏、候选数受 `RACE_WIDTH_DEFAULT` 约束；
+`direct_edge_ok` 同理（慢的候选不许拖住已经验通的那个）。
+`race_connect` 本身在 `tests/test_edge_bridge.py` 里还有一组：胜者优先、全败立刻返回不干等
+`race_timeout`、`race` 限宽、空候选、败者 fd 回收，以及「`race_edges` 确实委派给 `race_connect`」
+（防止桥与探针再次各写一份而漂移）。
 
 测试全程不联网：用一个本地 TCP 监听桩冒充沙盒代理，root 与 systemctl 也都是注入的假实现。
 

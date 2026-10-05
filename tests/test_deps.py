@@ -111,6 +111,17 @@ def patched(**replacements):
 
 
 @contextlib.contextmanager
+def no_sleep():
+    """Drop the probe's between-round pause; the retry is what is under test."""
+    old = cfbridge.time.sleep
+    cfbridge.time.sleep = lambda _seconds: None
+    try:
+        yield
+    finally:
+        cfbridge.time.sleep = old
+
+
+@contextlib.contextmanager
 def fake_edge_ips(ips=("198.41.192.7", "198.41.192.27")):
     """collect_deps resolves edge candidates over the network; don't."""
     saved = cfbridge.edge_bridge.fetch_edge_ips
@@ -281,9 +292,148 @@ class ProbeEdgeViaProxyTests(ProxyEnvGuard):
         proxy = LiveProxy(fail_connect=True)
         self.addCleanup(proxy.close)
         target = cfbridge.parse_proxy(proxy.url)
-        ok, detail = cfbridge.probe_edge_via_proxy(target, ["198.41.192.7"], timeout=5)
+        with no_sleep():
+            ok, detail = cfbridge.probe_edge_via_proxy(target, ["198.41.192.7"], timeout=5)
         self.assertFalse(ok)
         self.assertIn("CONNECT failed", detail)
+
+
+class ProbeEdgeRacingTests(unittest.TestCase):
+    """The probe must race like the bridge, and must not cry wolf.
+
+    Reported live: the first `doctor` said `edge via proxy MISSING` and
+    told the user to inspect the proxy's CONNECT policy, while a direct
+    re-test with the bridge's own connect_via_proxy reached every
+    candidate in 0.2s. The probe was walking the candidates one at a
+    time with an 8s timeout each, so one transient hiccup on the shared
+    egress produced a confident verdict about a healthy proxy.
+    """
+
+    def setUp(self):
+        self.original = cfbridge.edge_bridge.race_connect
+        self.addCleanup(lambda: setattr(cfbridge.edge_bridge, "race_connect", self.original))
+
+    def test_races_all_candidates_in_one_call(self):
+        seen = {}
+
+        def fake_race(candidates, proxy, **kwargs):
+            seen["candidates"] = list(candidates)
+            seen["kwargs"] = kwargs
+            return None
+
+        cfbridge.edge_bridge.race_connect = fake_race
+        ips = [f"198.41.192.{i}" for i in range(1, 6)]
+        with no_sleep():
+            ok, detail = cfbridge.probe_edge_via_proxy(("127.0.0.1", 1, None), ips,
+                                                       timeout=5, rounds=1)
+        self.assertFalse(ok)
+        # One call carrying every candidate — never one CONNECT per candidate.
+        self.assertEqual(seen["candidates"], ips)
+        self.assertEqual(seen["kwargs"]["connect_timeout"], 5)
+        self.assertEqual(seen["kwargs"]["race_timeout"], 9)
+        self.assertIn("CONNECT failed", detail)
+
+    def test_candidate_count_is_capped_at_the_bridge_race_width(self):
+        seen = {}
+
+        def fake_race(candidates, proxy, **kwargs):
+            seen["candidates"] = list(candidates)
+            return None
+
+        cfbridge.edge_bridge.race_connect = fake_race
+        with no_sleep():
+            cfbridge.probe_edge_via_proxy(("127.0.0.1", 1, None),
+                                          [f"ip{i}" for i in range(30)], rounds=1)
+        self.assertEqual(len(seen["candidates"]), cfbridge.edge_bridge.RACE_WIDTH_DEFAULT)
+
+    def test_a_transient_first_round_is_retried_before_reporting(self):
+        calls = []
+
+        def flaky(candidates, proxy, **kwargs):
+            calls.append(1)
+            if len(calls) == 1:
+                return None
+            return "198.41.192.7", socket.socket(), b""
+
+        cfbridge.edge_bridge.race_connect = flaky
+        with no_sleep():
+            ok, detail = cfbridge.probe_edge_via_proxy(("127.0.0.1", 1, None),
+                                                       ["198.41.192.7"], timeout=5)
+        self.assertTrue(ok, detail)
+        self.assertEqual(len(calls), 2)
+        self.assertIn("attempt 2 of 2", detail)
+
+    def test_failure_is_reported_only_after_every_attempt(self):
+        calls = []
+
+        def always_fail(candidates, proxy, **kwargs):
+            calls.append(1)
+            return None
+
+        cfbridge.edge_bridge.race_connect = always_fail
+        with no_sleep():
+            ok, detail = cfbridge.probe_edge_via_proxy(("127.0.0.1", 1, None),
+                                                       ["198.41.192.7"], timeout=5)
+        self.assertFalse(ok)
+        self.assertEqual(len(calls), cfbridge.EDGE_PROBE_ROUNDS)
+        self.assertIn("over 2 attempt(s)", detail)
+
+    def test_no_candidates_is_reported_clearly(self):
+        ok, detail = cfbridge.probe_edge_via_proxy(("127.0.0.1", 1, None), [])
+        self.assertFalse(ok)
+        self.assertIn("no edge candidates", detail)
+
+    def test_the_winning_socket_is_closed(self):
+        opened = []
+
+        def race(candidates, proxy, **kwargs):
+            sock = socket.socket()
+            opened.append(sock)
+            return "198.41.192.7", sock, b""
+
+        cfbridge.edge_bridge.race_connect = race
+        ok, _ = cfbridge.probe_edge_via_proxy(("127.0.0.1", 1, None), ["198.41.192.7"])
+        self.assertTrue(ok)
+        # A probe that forgets to close leaks one fd per doctor run.
+        self.assertEqual(opened[0].fileno(), -1)
+
+
+class DirectEdgeProbeTests(unittest.TestCase):
+    """Same defect class as the bridge probe: never block on one IP."""
+
+    def setUp(self):
+        self.original = cfbridge._verified_edge_tls
+        self.addCleanup(lambda: setattr(cfbridge, "_verified_edge_tls", self.original))
+
+    def test_a_slow_candidate_does_not_delay_a_working_one(self):
+        def fake(ip, timeout):
+            if ip == "198.41.192.7":
+                time.sleep(5)          # sequential code would wait this out
+                return False
+            return True
+
+        cfbridge._verified_edge_tls = fake
+        started = time.monotonic()
+        self.assertTrue(cfbridge.direct_edge_ok(["198.41.192.7", "198.41.192.27"], timeout=1))
+        self.assertLess(time.monotonic() - started, 3.0)
+
+    def test_all_candidates_failing_is_false(self):
+        cfbridge._verified_edge_tls = lambda ip, timeout: False
+        self.assertFalse(cfbridge.direct_edge_ok(["198.41.192.7", "198.41.192.27"], timeout=1))
+
+    def test_a_single_candidate_skips_the_thread_dance(self):
+        calls = []
+
+        def fake(ip, timeout):
+            calls.append(ip)
+            return True
+
+        cfbridge._verified_edge_tls = fake
+        self.assertTrue(cfbridge.direct_edge_ok(["198.41.192.7"], timeout=1))
+        self.assertEqual(calls, ["198.41.192.7"])
+
+    def test_no_candidates_is_false(self):
+        self.assertFalse(cfbridge.direct_edge_ok([]))
 
 
 class DepModelTests(unittest.TestCase):

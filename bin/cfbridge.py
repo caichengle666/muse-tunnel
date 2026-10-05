@@ -47,6 +47,7 @@ import socket
 import ssl
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -644,22 +645,48 @@ def probe_proxy_endpoint(url: str, timeout: float = 6) -> tuple[bool, str]:
     return True, "accepts TCP"
 
 
+# A health probe must not cry wolf. One pass over the edge candidates
+# used to be enough to report MISSING with "check the proxy's CONNECT
+# policy for port 7844" — a confident verdict about a proxy that was
+# answering in 0.2s, produced by a single transient hiccup on the shared
+# egress. Probe in the bridge's own racing style (see race_connect) and
+# give a failed round one more chance before saying anything.
+EDGE_PROBE_ROUNDS = 2
+EDGE_PROBE_RETRY_DELAY = 1.5
+
+
 def probe_edge_via_proxy(proxy: tuple[str, int, str | None], ips: list[str],
-                         timeout: float = 8) -> tuple[bool, str]:
+                         timeout: float = 8, rounds: int = EDGE_PROBE_ROUNDS
+                         ) -> tuple[bool, str]:
     """The dependency that actually matters in bridge mode: a CONNECT
-    through the proxy to a real edge IP, exactly what the bridge does."""
-    tried: list[str] = []
-    for ip in ips[:3]:
-        tried.append(ip)
-        got = edge_bridge.connect_via_proxy(ip, timeout, proxy)
-        if got is not None:
-            sock, _ = got
+    through the proxy to a real edge IP, exactly what the bridge does.
+
+    It goes through edge_bridge.race_connect() — the very function the
+    bridge uses — because walking the candidates one at a time is the
+    mistake references/architecture.md calls out: a single unresponsive
+    edge then holds its CONNECT for the whole timeout, so one unlucky
+    round is enough to declare a working proxy broken.
+    """
+    candidates = [ip for ip in ips[:edge_bridge.RACE_WIDTH_DEFAULT] if ip]
+    if not candidates:
+        return False, "no edge candidates to try (DoH lookup returned nothing)"
+    attempts = max(1, rounds)
+    for round_no in range(1, attempts + 1):
+        raced = edge_bridge.race_connect(candidates, proxy,
+                                         connect_timeout=timeout,
+                                         race_timeout=timeout + 4)
+        if raced is not None:
+            ip, sock, _ = raced
             try:
                 sock.close()
             except OSError:
                 pass
-            return True, f"CONNECT {ip}:{edge_bridge.EDGE_PORT} through the proxy succeeded"
-    return False, f"CONNECT failed for {', '.join(tried) or 'no candidates'}"
+            suffix = "" if round_no == 1 else f" (attempt {round_no} of {attempts})"
+            return True, f"CONNECT {ip}:{edge_bridge.EDGE_PORT} through the proxy succeeded{suffix}"
+        if round_no < attempts:
+            time.sleep(EDGE_PROBE_RETRY_DELAY)
+    return False, (f"CONNECT failed for all {len(candidates)} candidate(s) "
+                   f"over {attempts} attempt(s)")
 
 
 def resolve_proxy(proj: str, timeout: float = 6) -> tuple[str, str, bool, str]:
@@ -807,7 +834,8 @@ def collect_deps(proj: str, cfg: dict, mode: str, timeout: float = 6) -> list[di
             ok, detail = probe_edge_via_proxy(target, real_ips, timeout=timeout)
             deps.append(dep("edge via proxy", ok, detail,
                             heal="" if ok else
-                            "cannot be fixed from here: check the proxy's CONNECT policy for port 7844"))
+                            "cannot be fixed from here: every candidate failed twice — "
+                            "check the proxy's CONNECT policy/ACLs for port 7844"))
     else:
         ok = direct_edge_ok(real_ips, timeout=timeout)
         deps.append(dep("direct edge", ok, f"verified TLS to edge:7844 = {ok}",
@@ -1092,6 +1120,29 @@ def is_fake_ip(ip: str) -> bool:
         return False
 
 
+def _verified_edge_tls(ip: str, timeout: float) -> bool:
+    """A certificate-verified h2 handshake with one edge IP."""
+    try:
+        raw = socket.create_connection((ip, edge_bridge.EDGE_PORT), timeout=timeout)
+    except OSError:
+        return False
+    try:
+        ctx = ssl.create_default_context()
+        try:
+            ctx.set_alpn_protocols(["h2"])
+        except NotImplementedError:
+            pass
+        with ctx.wrap_socket(raw, server_hostname="region1.v2.argotunnel.com"):
+            return True
+    except Exception:  # noqa: BLE001 - any TLS/OS error means "not the real edge"
+        return False
+    finally:
+        try:
+            raw.close()
+        except OSError:
+            pass
+
+
 def direct_edge_ok(ips: list[str], timeout: float = 5) -> bool:
     """True only if a *verified* TLS handshake with the edge completes.
 
@@ -1100,23 +1151,30 @@ def direct_edge_ok(ips: list[str], timeout: float = 5) -> bool:
     unverified handshake may complete against an interceptor. Verify
     the certificate for the argotunnel hostname and require ALPN —
     anything less is not the real edge path cloudflared needs.
-    """
-    import ssl as _ssl
 
-    for ip in ips[:3]:
-        try:
-            raw = socket.create_connection((ip, edge_bridge.EDGE_PORT), timeout=timeout)
-            ctx = _ssl.create_default_context()
-            try:
-                ctx.set_alpn_protocols(["h2"])
-            except NotImplementedError:
-                pass
-            s = ctx.wrap_socket(raw, server_hostname="region1.v2.argotunnel.com")
-            s.close()
-            return True
-        except Exception:  # noqa: BLE001 - OSError and ssl errors both mean no
-            continue
-    return False
+    The candidates are attempted concurrently, for the same reason the
+    bridge races them: done one at a time, a single silent IP costs the
+    whole timeout and a transient hiccup reads as "direct does not work",
+    which quietly forces the project into bridge mode.
+    """
+    candidates = [ip for ip in ips[:edge_bridge.RACE_WIDTH_DEFAULT] if ip]
+    if not candidates:
+        return False
+    if len(candidates) == 1:
+        return _verified_edge_tls(candidates[0], timeout)
+    found = threading.Event()
+
+    def attempt(ip: str) -> None:
+        if _verified_edge_tls(ip, timeout):
+            found.set()
+
+    for t in [threading.Thread(target=attempt, args=(ip,), daemon=True) for ip in candidates]:
+        t.start()
+    # Each attempt is bounded by timeout for the connect and again for the
+    # handshake, hence the slack; stragglers are daemons and finish on
+    # their own.
+    found.wait(timeout=timeout * 2 + 1)
+    return found.is_set()
 
 
 def cloudflared_version(binary: str) -> str | None:

@@ -1,5 +1,48 @@
 # CHANGELOG
 
+## 未发布 — 依赖探针不再误报（沿用桥的并行竞速）
+
+用户实测报上来的：第一次 `doctor` 把 `edge via proxy` 判成 **MISSING**，还提示「检查代理对 7844 的
+CONNECT 策略」；第二次加 `--fix` 重跑、**环境一点没变**，这一项直接 ok；用桥自己的
+`connect_via_proxy` 单独复测，三个候选 IP **0.2 秒全通**。
+
+根因是诊断没遵守项目自己定的规矩：`probe_edge_via_proxy()` 写的是 `for ip in ips[:3]`，一个一个试、
+每个等 8 秒，而 `references/architecture.md` 里白纸黑字写着「候选 edge 必须并行竞速，顺序试是错的」。
+于是共享出口上的一次瞬时抖动，就换来一条语气笃定、指向错误方向的结论。
+
+### 修法：把竞速抽成一个函数，两边共用
+
+`edge_bridge.race_connect()` 从原来的 `EdgeBridge.race_edges()` 里抽出来成为模块级函数，
+桥的 `race_edges()` 现在只是它的一个薄封装，`cfbridge` 的探针直接调它。**同一件事一份实现**——
+两边各写一份正是它们当初漂移的原因，测试里专门有一条盯「桥确实委派给它」。
+
+顺手修掉竞速本身的第二个毛病：原来 `done.wait(timeout=race_timeout)` 只有在**赢了**的时候才会提前返回，
+所以「所有候选都被干脆拒绝」这种局面反而要干等满 12 秒，把一次利落的 403 伪装成「代理卡住了」。
+现在等到「有一个赢了」**或**「最后一个尝试也放弃」就返回。
+
+### 探针
+
+- `probe_edge_via_proxy()`：并发竞速全部候选（宽度用 `RACE_WIDTH_DEFAULT`），
+  一轮全败**再跑一轮**（`EDGE_PROBE_ROUNDS = 2`，间隔 1.5s）才判 MISSING。失败文案也改成
+  「每个候选两次都失败」，并写明该查代理对 7844 的 ACL。
+- `direct_edge_ok()`：同类缺陷一起修。它同样是 `ips[:3]` 顺序试、每个 5 秒，一个不理人的 IP 就能
+  把项目误判进桥模式。现在并发拨候选、谁先验通证书算谁（单候选时直接短路，不起线程）。
+  最坏耗时从 3×2×5s 降到 2×timeout+1。
+
+已复现报告里的场景并对比：一个「前 3 次 CONNECT 回 403、之后放行」的桩代理，
+**旧逻辑 ok=False（MISSING）**，**新逻辑 ok=True … (attempt 2 of 2)**，1.5 秒返回。
+
+### 测试与文档
+
+`tests/test_deps.py` 新增 `ProbeEdgeRacingTests`（一次调用就带上全部候选、候选数受竞速宽度约束、
+一轮抖动会被重试、两轮全败才报错、赢到的 socket 必须关掉）与 `DirectEdgeProbeTests`；
+`tests/test_edge_bridge.py` 新增 `RaceConnectTests`（胜者优先、全败立即返回、`race` 限宽、空候选、
+败者 fd 回收）与「`race_edges` 委派」一条。CI 三个版本 **185 项测试**全绿。
+
+`architecture.md` 补了「为什么只能有一份竞速实现」和探针的重试规则；`troubleshooting.md` 加了
+「MISSING 但重跑就好」「direct/bridge 来回翻」两行；SKILL.md 加了第 13 条 operating rule
+（禁止在探针里写顺序遍历候选）。
+
 ## 未发布 — 日志保留、源站 TLS、API 纪律
 
 针对「这个功能还需要完善什么」的四项（外加一项按用户要求不动）：

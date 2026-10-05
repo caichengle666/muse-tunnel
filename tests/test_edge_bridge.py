@@ -385,6 +385,111 @@ class RaceEdgesTests(unittest.TestCase):
         bridge = self._bridge(["198.41.192.7", "198.41.192.27"])
         self.assertIsNone(bridge.race_edges())
 
+    def test_race_edges_delegates_to_the_shared_race(self):
+        """The bridge and cfbridge's probe must share one implementation.
+
+        They used to carry separate copies, and the probe's copy drifted
+        into trying candidates one at a time — the very mistake
+        architecture.md says makes a single dead edge eat the budget.
+        """
+        seen = {}
+
+        def fake(candidates, proxy, **kwargs):
+            seen["candidates"] = list(candidates)
+            seen["proxy"] = proxy
+            seen["kwargs"] = kwargs
+            return None
+
+        original = edge_bridge.race_connect
+        edge_bridge.race_connect = fake
+        self.addCleanup(lambda: setattr(edge_bridge, "race_connect", original))
+
+        bridge = self._bridge(["198.41.192.7", "198.41.192.27"])
+        self.assertIsNone(bridge.race_edges())
+        self.assertEqual(seen["candidates"], ["198.41.192.7", "198.41.192.27"])
+        self.assertEqual(seen["proxy"], bridge.proxy)
+        self.assertEqual(seen["kwargs"],
+                         {"race": bridge.race, "connect_timeout": bridge.connect_timeout,
+                          "race_timeout": bridge.race_timeout})
+
+
+class RaceConnectTests(unittest.TestCase):
+    """race_connect is the one implementation both callers share."""
+
+    def setUp(self):
+        self.original = edge_bridge.connect_via_proxy
+        self.addCleanup(lambda: setattr(edge_bridge, "connect_via_proxy", self.original))
+
+    def test_first_success_wins(self):
+        def fake(ip, timeout, proxy):
+            s, _ = socket.socketpair()
+            if ip == "dead":
+                s.close()
+                return None
+            return s, b"prefix-bytes"
+
+        edge_bridge.connect_via_proxy = fake
+        raced = edge_bridge.race_connect(["dead", "alive"], ("proxy", 1, None))
+        self.assertIsNotNone(raced)
+        ip, sock, prefix = raced
+        self.assertEqual(ip, "alive")
+        self.assertEqual(prefix, b"prefix-bytes")
+        sock.close()
+
+    def test_a_round_that_fails_everywhere_returns_at_once(self):
+        """Waiting out race_timeout after every attempt failed is pure stall.
+
+        A proxy answering 403 to every candidate used to leave the caller
+        blocked for the whole race timeout, which is what made a clean
+        refusal look like a hung proxy.
+        """
+        def refused(ip, timeout, proxy):
+            time.sleep(0.05)
+            return None
+
+        edge_bridge.connect_via_proxy = refused
+        started = time.monotonic()
+        self.assertIsNone(edge_bridge.race_connect(["a", "b", "c"], ("proxy", 1, None),
+                                                   race_timeout=30))
+        self.assertLess(time.monotonic() - started, 5.0)
+
+    def test_race_width_caps_the_candidates(self):
+        tried = []
+
+        def fake(ip, timeout, proxy):
+            tried.append(ip)
+            return None
+
+        edge_bridge.connect_via_proxy = fake
+        edge_bridge.race_connect([f"ip{i}" for i in range(20)], ("proxy", 1, None), race=3)
+        self.assertEqual(len(tried), 3)
+
+    def test_no_usable_candidate_is_none(self):
+        self.assertIsNone(edge_bridge.race_connect([], ("proxy", 1, None)))
+        self.assertIsNone(edge_bridge.race_connect(["", None], ("proxy", 1, None)))
+
+    def test_losing_sockets_are_closed(self):
+        made = []
+
+        def fake(ip, timeout, proxy):
+            s, peer = socket.socketpair()
+            made.append((ip, s))
+            if ip == "slow":
+                peer.close()
+                return None
+            return s, b""
+
+        edge_bridge.connect_via_proxy = fake
+        raced = edge_bridge.race_connect(["slow", "fast"], ("proxy", 1, None))
+        self.assertIsNotNone(raced)
+        ip, winner, _ = raced
+        self.assertEqual(ip, "fast")
+        winner.close()
+        # Only the winner may still hold an fd.
+        for _, s in made:
+            if s is not winner:
+                s.close()
+
 
 class MiscTests(unittest.TestCase):
     def test_parse_listen_defaults_host(self):

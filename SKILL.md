@@ -39,6 +39,8 @@ $CFB --project ~/workspace/projects/<proj> teardown [--purge-project]  # 删隧�
 
 `doctor` 不是「打印环境变量存不存在」，而是逐个**真的去用**一遍：代理要连得上、要能 CONNECT 到真实边缘 7844、cloudflared 要跑得起来并报版本、桥端口要可用、有 start_cmd 的服务要能起（venv 在不在）。输出每个依赖 `ok` / `MISSING` / `optional` 三种状态，**有 required 项缺失时退出码为 1**，可直接当健康检查用。
 
+探针的判定必须可信，否则误导用户去查一个不存在的问题：`edge via proxy` 与 `direct edge` 都**并发竞速全部候选**（直接复用桥的 `edge_bridge.race_connect()`，不另写一份），并且 `edge via proxy` 一轮全败会**再跑一轮**才判 MISSING。所以这两项报 MISSING 就是结论，照 `heal` 列处理即可，别建议用户「再试一次」——历史上这里顺序试候选、一轮就下结论，一次瞬时抖动就冤枉过一个 0.2 秒就通的代理。
+
 `doctor --fix` 和 `up` 会顺手修掉工具自己该负责的那些：
 
 | 依赖 | 自愈动作 |
@@ -138,4 +140,5 @@ cloudflared 二进制一旦落到项目 `bin/` 就被长期复用，所以默认
 10. 代理 URL 里含凭据：任何输出（包括 `fixed:` 行、日志、交给 hook 的 prompt）都只允许出现脱敏后的 `http://***@host:port`，不要把完整代理 URL 或密钥打进聊天。
 11. 源站安全默认不可退让：`https://` 源站没给出证书名就不许注册（别擅自替用户关校验）；`tcp://` / `ssh://` / `rdp://` 必须 `--allow-tcp-origin` 并当面说清「浏览器打不开，客户端要跑 cloudflared access」。用户报「隧道通了但公网 502」时，先查 origin 是不是这些坑，再怀疑隧道。
 12. 日志保留策略只允许原地截断，禁止改成 rename/删除活动日志。要动 `prune_logs`、`rotate_log_in_place` 或 hook 里那段调用，先读上面「日志保留」三条实现要点。
+13. **同时试候选的地方只能有一份实现**：桥与诊断都走 `edge_bridge.race_connect()`。禁止在任何探针/健康检查里写 `for ip in ips[:3]` 这类顺序遍历——它会让一次瞬时抖动变成一条吓人的结论。新增任何「连一下试试」的检查，先看能不能复用 `race_connect`；探针报故障前至少重试一轮。
 

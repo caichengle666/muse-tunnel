@@ -18,10 +18,12 @@ Subcommands:
     init              scaffold a project
     add-service       register a service (hostname -> origin)
     demo              register the bundled key-authed WS demo origin
-    up                self-heal deps, ensure tunnel+DNS, render+install
-                      units, start bridge -> services -> cloudflared
+    up                self-heal deps, prune logs, ensure tunnel+DNS,
+                      render+install units, start bridge -> services ->
+                      cloudflared
     status            units + local/public health
     verify            public end-to-end checks (HTTPS health, WS auth)
+    prune-logs        enforce the log retention window
     down              stop managed units (tunnel/DNS stay)
     install-autostart render the keepalive hook script + next steps
     teardown          stop units, delete DNS + tunnel (--purge-project)
@@ -79,7 +81,23 @@ ARCH_ASSETS = {
     "i686": "cloudflared-linux-386",
 }
 MIN_CLOUDFLARED_BYTES = 5 * 1024 * 1024
-ORIGIN_SCHEMES = ("http://", "https://", "tcp://", "unix:")
+
+# Ingress `service:` begins with one of these. The split matters: an
+# http-ish origin is what a browser can open through the tunnel, while
+# tcp/ssh/rdp are raw streams that only speak to clients running
+# `cloudflared access`. `unix:` is HTTP over a unix socket, so it stays
+# on the http side.
+HTTP_ORIGIN_SCHEMES = ("http://", "https://", "unix:")
+RAW_TCP_ORIGIN_SCHEMES = ("tcp://", "ssh://", "rdp://")
+ORIGIN_SCHEMES = HTTP_ORIGIN_SCHEMES + RAW_TCP_ORIGIN_SCHEMES
+LOOPBACK_ORIGIN_HOSTS = {"127.0.0.1", "::1", "0.0.0.0", "localhost"}
+# Keys we are willing to forward to cloudflared's originRequest. An
+# allow-list, because a typo silently becomes a rule that is ignored.
+ORIGIN_REQUEST_KEYS = {
+    "originServerName", "noTLSVerify", "caPool", "httpHostHeader",
+    "http2Origin", "connectTimeout", "tlsTimeout", "keepAliveTimeout",
+    "keepAliveConnections", "disableChunkedEncoding", "matchSNItoHost",
+}
 
 
 # ---------------------------------------------------------------- utils
@@ -333,6 +351,170 @@ def python_bin() -> str:
 def read_template(rel: str) -> str:
     with open(os.path.join(SKILL_DIR, "templates", rel), encoding="utf-8") as f:
         return f.read()
+
+
+# ---------------------------------------------------------------- logs
+#
+# systemd writes every log with `StandardOutput=append:` — raw stdout,
+# no timestamps — into the project dir, which on this kind of sandbox is
+# the only persistent volume. Nothing bounded them: a chatty user
+# program could fill $HOME and take config.json and secrets/ down with
+# it, and the log of a service removed long ago would sit there forever.
+#
+# "How old is this content" cannot be answered from such a file, so the
+# window is enforced structurally instead: a size cap on every call,
+# plus a rolling interval recorded in run/log-retention.json. Rotation
+# happens in place (see rotate_log_in_place) because systemd keeps the
+# fd open for appends.
+
+LOG_RETENTION_HOURS_DEFAULT = 24.0
+LOG_MAX_BYTES_DEFAULT = 8 * 1024 * 1024
+LOG_TAIL_BYTES_DEFAULT = 1 * 1024 * 1024
+
+
+def log_retention_state_path(proj: str) -> str:
+    return os.path.join(proj, "run", "log-retention.json")
+
+
+def expected_log_names(proj: str) -> set[str]:
+    """Log files a currently managed unit of this project may be writing.
+
+    Anything else under logs/ belongs to a unit that no longer exists.
+    A missing or unparsable config must not disable pruning, so it is
+    read leniently — the worst case is that svc-*.log counts as unknown.
+    """
+    names = {"cloudflared.log", "bridge.log", "last-doctor-fix.log"}
+    try:
+        cfg = load_config_or_empty(proj)
+    except (OSError, ValueError):
+        return names
+    for s in cfg.get("services") or []:
+        if s.get("start_cmd"):
+            names.add(f"svc-{s['name']}.log")
+    return names
+
+
+def rotate_log_in_place(path: str, tail_bytes: int) -> bool:
+    """Keep only the last `tail_bytes` of a live log. True if it shrank.
+
+    In place, never by rename: systemd holds the fd open for appends and
+    keeps writing to whatever inode it opened, so a rename would orphan
+    the live log and leave an invisible, ever-growing file behind.
+    Rewriting the same inode works because O_APPEND seeks to the (new)
+    end before every write. Keeping the tail rather than emptying the
+    file preserves the crash context that makes the log worth having.
+    """
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return False
+    if size <= tail_bytes:
+        return False
+    try:
+        with open(path, "rb") as f:
+            f.seek(-tail_bytes, os.SEEK_END)
+            keep = f.read(tail_bytes)
+    except OSError:
+        return False
+    try:
+        with open(path, "wb") as f:  # O_TRUNC on the same inode
+            f.write(keep)
+    except OSError:
+        return False
+    return True
+
+
+def retention_hours_from_config(cfg: dict) -> float:
+    raw = cfg.get("log_retention_hours", LOG_RETENTION_HOURS_DEFAULT)
+    try:
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        return LOG_RETENTION_HOURS_DEFAULT
+
+
+def _rotation_due(proj: str, now: float, window: float) -> bool:
+    if window <= 0:
+        return False
+    try:
+        with open(log_retention_state_path(proj), encoding="utf-8") as f:
+            last = float(json.load(f).get("rotated_at") or 0.0)
+    except (OSError, ValueError, TypeError, AttributeError):
+        return True  # no state yet: start bounding the existing output now
+    return (now - last) >= window
+
+
+def _write_rotation_state(proj: str, now: float, retention_hours: float) -> None:
+    try:
+        write_private(log_retention_state_path(proj),
+                      json.dumps({"rotated_at": now, "window_hours": retention_hours}) + "\n",
+                      dir_mode=None)
+    except OSError:
+        pass
+
+
+def prune_logs(proj: str, retention_hours: float = LOG_RETENTION_HOURS_DEFAULT,
+               max_bytes: int = LOG_MAX_BYTES_DEFAULT,
+               tail_bytes: int = LOG_TAIL_BYTES_DEFAULT,
+               force_rotate: bool = False) -> list[str]:
+    """Enforce the log retention window. Returns what was done, for logs.
+
+    retention_hours <= 0 disables pruning entirely (except --force).
+    Called from `up` and from every keepalive-hook poll, so it has to
+    stay cheap and idempotent.
+    """
+    logs_dir = os.path.join(proj, "logs")
+    if not os.path.isdir(logs_dir):
+        return []
+    window = max(0.0, retention_hours) * 3600.0
+    if window <= 0 and not force_rotate:
+        return []
+    now = time.time()
+    actions: list[str] = []
+    expected = expected_log_names(proj)
+
+    for name in sorted(os.listdir(logs_dir)):
+        if not name.endswith(".log"):
+            continue
+        path = os.path.join(logs_dir, name)
+        if not os.path.isfile(path):
+            continue
+        try:
+            st = os.stat(path)
+        except OSError:
+            continue
+        if window > 0 and name not in expected and (now - st.st_mtime) >= window:
+            # Nothing writes this any more, so its mtime really is the
+            # last write; the file is a leftover from a removed unit.
+            try:
+                os.remove(path)
+                actions.append(f"removed stale log {name}")
+            except OSError:
+                pass
+            continue
+        if st.st_size > max_bytes and rotate_log_in_place(path, tail_bytes):
+            actions.append(f"capped {name} at {tail_bytes // 1024} KiB")
+
+    if force_rotate or _rotation_due(proj, now, window):
+        for name in sorted(expected):
+            path = os.path.join(logs_dir, name)
+            if os.path.isfile(path) and rotate_log_in_place(path, tail_bytes):
+                actions.append(f"rotated {name}")
+        _write_rotation_state(proj, now, retention_hours)
+    return actions
+
+
+def cmd_prune_logs(args) -> None:
+    proj = project_dir(args)
+    hours = args.retention_hours
+    if hours is None:
+        hours = retention_hours_from_config(load_config_or_empty(proj))
+    actions = prune_logs(proj, retention_hours=hours, force_rotate=args.force)
+    if getattr(args, "json", False):
+        print(json.dumps({"retention_hours": hours, "actions": actions}, ensure_ascii=False))
+        return
+    if not getattr(args, "quiet", False):
+        for line in actions:
+            print(f"logs: {line}")
 
 
 # ---------------------------------------------------------------- dependencies
@@ -1174,6 +1356,61 @@ def cmd_init(args) -> None:
 
 # ---------------------------------------------------------------- services
 
+def origin_host(origin: str) -> str:
+    """Host part of an origin URL ('' for unix sockets or garbage)."""
+    raw = (origin or "").strip()
+    if not raw:
+        return ""
+    try:
+        return (urllib.parse.urlparse(raw).hostname or "").lower()
+    except ValueError:
+        return ""
+
+
+def normalize_origin(svc: dict) -> bool:
+    """Fill in the TLS decision for a loopback https origin.
+
+    cloudflared checks the origin certificate against the *service URL
+    host* when originServerName is empty, so `https://127.0.0.1:8443`
+    demands a certificate whose name is literally `127.0.0.1`. Loopback
+    certs are self-signed and almost never carry that name, so the
+    tunnel looks healthy while every request is a 502. For a hop that
+    never leaves the machine, defaulting to noTLSVerify is the sane
+    answer; callers that want real verification pass originServerName.
+
+    Returns True when the service was modified (so callers can persist).
+    Non-loopback https origins are left alone for validate_service() to
+    reject — there the answer depends on a certificate we cannot see.
+    """
+    if not (svc.get("origin") or "").strip().startswith("https://"):
+        return False
+    req = dict(svc.get("origin_request") or {})
+    if req.get("originServerName") or req.get("noTLSVerify"):
+        return False
+    if origin_host(svc.get("origin", "")) not in LOOPBACK_ORIGIN_HOSTS:
+        return False
+    req["noTLSVerify"] = True
+    svc["origin_request"] = req
+    return True
+
+
+def parse_origin_request(raw: str) -> dict:
+    """Parse --origin-request JSON, rejecting keys cloudflared ignores."""
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as e:
+        die(f"--origin-request is not valid JSON: {e}")
+    if not isinstance(parsed, dict):
+        die("--origin-request must be a JSON object")
+    unknown = sorted(set(parsed) - ORIGIN_REQUEST_KEYS)
+    if unknown:
+        die(f"--origin-request has unsupported key(s) {unknown}; "
+            f"allowed: {', '.join(sorted(ORIGIN_REQUEST_KEYS))}")
+    return parsed
+
+
 def validate_service(cfg: dict, svc: dict, allow_public: bool) -> None:
     host = svc.get("hostname", "")
     zone = cfg.get("zone", "")
@@ -1197,13 +1434,44 @@ def validate_service(cfg: dict, svc: dict, allow_public: bool) -> None:
     health = svc.get("health") or "/health"
     if not str(health).startswith("/"):
         die(f"health path must start with '/': {health!r}")
-    origin = (svc.get("origin") or "").strip()
-    if origin and not origin.startswith(ORIGIN_SCHEMES):
-        die(f"origin must start with one of {', '.join(ORIGIN_SCHEMES)}: {origin!r}")
     for field in ("start_cmd", "workdir", "origin"):
         val = svc.get(field) or ""
         if "\n" in val or "\r" in val:
             die(f"{field} must not contain newlines")
+    origin = (svc.get("origin") or "").strip()
+    if origin and not origin.startswith(ORIGIN_SCHEMES):
+        die(f"origin must start with one of {', '.join(ORIGIN_SCHEMES)}: {origin!r}")
+    if origin.startswith(RAW_TCP_ORIGIN_SCHEMES) and not svc.get("tcp_origin_confirmed"):
+        die(f"origin {origin} is a raw TCP stream: nothing a browser can open. "
+            "Clients must run `cloudflared access tcp --hostname <host> "
+            "--url 127.0.0.1:<local port>`. Pass --allow-tcp-origin if that "
+            "is what you want (an `http://` origin is the browser-reachable one).")
+    _validate_origin_request(svc)
+
+
+def _validate_origin_request(svc: dict) -> None:
+    req = svc.get("origin_request") or {}
+    if not isinstance(req, dict):
+        die("origin_request must be a JSON object")
+    unknown = sorted(set(req) - ORIGIN_REQUEST_KEYS)
+    if unknown:
+        die(f"unsupported origin_request key(s) {unknown}; "
+            f"allowed: {', '.join(sorted(ORIGIN_REQUEST_KEYS))}")
+    for key, val in req.items():
+        if isinstance(val, str) and ("\n" in val or "\r" in val):
+            die(f"origin_request.{key} must not contain newlines")
+    origin = (svc.get("origin") or "").strip()
+    if not origin.startswith("https://"):
+        return
+    # Without one of these cloudflared verifies against the URL host and
+    # the request fails as a 502 that looks like a broken tunnel.
+    if not (req.get("originServerName") or req.get("noTLSVerify")):
+        host = origin_host(origin) or origin
+        die(f"origin {origin} is https but no origin TLS decision is recorded: "
+            f"cloudflared would expect a certificate named {host!r} and answer 502 "
+            "otherwise. Add \"origin_request\": {\"originServerName\": \"<cert name>\"} "
+            "(or {\"noTLSVerify\": true} for a trusted private hop) to the service, "
+            "or re-register with --origin-tls-name / --origin-no-verify.")
 
 
 def find_service(cfg: dict, name: str) -> dict | None:
@@ -1218,6 +1486,7 @@ def cmd_add_service(args) -> None:
     cfg = load_config(proj)
     if find_service(cfg, args.name):
         die(f"service {args.name} already registered (edit config.json or remove it first)")
+    origin = (args.origin_url or "").strip()
     svc = {
         "name": args.name,
         "hostname": args.hostname,
@@ -1225,16 +1494,47 @@ def cmd_add_service(args) -> None:
         "health": args.health,
         "auth": args.auth,
         "public_confirmed": bool(args.auth == "public" and args.allow_public),
-        "origin": args.origin_url or "",
+        "origin": origin,
+        "origin_request": parse_origin_request(args.origin_request),
         "start_cmd": args.start_cmd or "",
         "workdir": args.workdir or proj,
         "env_proxy": bool(args.env_proxy),
     }
+    if origin.startswith(RAW_TCP_ORIGIN_SCHEMES):
+        # Consistency with --allow-public: the surprising choice has to
+        # be stated out loud, because the docs used to imply this was
+        # just another origin URL a browser could open.
+        svc["tcp_origin_confirmed"] = bool(args.allow_tcp_origin)
+    req = svc["origin_request"]
+    if args.origin_tls_name:
+        if not origin.startswith("https://"):
+            die("--origin-tls-name only applies to an https:// origin")
+        req["originServerName"] = args.origin_tls_name
+    if args.origin_no_verify:
+        if not origin.startswith("https://"):
+            die("--origin-no-verify only applies to an https:// origin")
+        req["noTLSVerify"] = True
+    if origin.startswith("https://") and not (req.get("originServerName") or req.get("noTLSVerify")):
+        if normalize_origin(svc):  # loopback: default to skipping verification
+            print(f"note: https origin on loopback ({origin_host(origin)}); origin TLS "
+                  "verification disabled for that private hop. Pass --origin-tls-name "
+                  "<cert name> to verify instead.")
+        else:
+            die(f"--origin-url {origin} is https but no certificate name was given: "
+                f"cloudflared would expect the origin certificate to be named "
+                f"{origin_host(origin)!r} and return 502 otherwise. Pass "
+                "--origin-tls-name <name in the certificate> (preferred), or "
+                "--origin-no-verify to skip verification on a trusted hop.")
     validate_service(cfg, svc, allow_public=args.allow_public)
     cfg["services"].append(svc)
     save_config(proj, cfg)
-    origin = cf_api.service_origin(svc)
-    print(f"registered {args.name}: {args.hostname} -> {origin} (auth={args.auth})")
+    shown = cf_api.service_origin(svc)
+    print(f"registered {args.name}: {args.hostname} -> {shown} (auth={args.auth})")
+    if svc.get("origin_request"):
+        print(f"originRequest: {json.dumps(svc['origin_request'], ensure_ascii=False)}")
+    if svc.get("tcp_origin_confirmed"):
+        print(f"note: {shown} is a raw TCP origin; clients need "
+              f"`cloudflared access tcp --hostname {args.hostname} --url 127.0.0.1:<port>`")
     print("apply with: cfbridge up")
 
 
@@ -1449,6 +1749,12 @@ def cmd_up(args) -> None:
     if not cfg["services"]:
         die("no services registered; use add-service or demo first")
     require_root("cfbridge up")
+    normalized = False
+    for s in cfg["services"]:
+        normalized = normalize_origin(s) or normalized
+    if normalized:
+        save_config(proj, cfg)
+        print("note: filled the default origin TLS decision for loopback https origin(s)")
     for s in cfg["services"]:
         # allow_public=False here on purpose: the public-exposure consent
         # is recorded once at add-service time (public_confirmed) and a
@@ -1474,6 +1780,8 @@ def cmd_up(args) -> None:
         die(f"{len(missing)} required dependency(ies) still missing -> {detail}")
 
     print(f"mode: {mode}")
+    for line in prune_logs(proj, retention_hours=retention_hours_from_config(cfg)):
+        print(f"logs: {line}")
     ensure_tunnel_stack(proj, cfg, force_dns=bool(getattr(args, "force_dns", False)))
     cfg = load_config(proj)
     units = render_units(proj, cfg, mode)
@@ -1864,8 +2172,23 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--auth", choices=["key", "public"], default="key")
     p.add_argument("--allow-public", action="store_true")
     p.add_argument("--origin-url", default="",
-                   help="override the origin URL (default http://127.0.0.1:<port>); "
-                        "http://, https://, tcp:// or unix: are accepted")
+                   help="override the origin URL (default http://127.0.0.1:<port>). "
+                        "http://, https:// and unix: are browser-reachable; "
+                        "tcp://, ssh:// and rdp:// are raw streams that need "
+                        "`cloudflared access` on the client (--allow-tcp-origin)")
+    p.add_argument("--origin-tls-name", default="",
+                   help="for an https:// origin: the name cloudflared should expect on "
+                        "the origin certificate (sets originRequest.originServerName)")
+    p.add_argument("--origin-no-verify", action="store_true",
+                   help="for an https:// origin: skip origin certificate verification "
+                        "(originRequest.noTLSVerify). Applied automatically to loopback "
+                        "origins, which are self-signed by definition")
+    p.add_argument("--origin-request", default="",
+                   help='extra originRequest as a JSON object, e.g. '
+                        '\'{"caPool": "/etc/ssl/certs/internal-ca.crt"}\'')
+    p.add_argument("--allow-tcp-origin", action="store_true",
+                   help="confirm a raw TCP origin (tcp://, ssh://, rdp://): browsers "
+                        "cannot open it, clients must run cloudflared access")
     p.add_argument("--start-cmd", default="")
     p.add_argument("--workdir", default="")
     p.add_argument("--env-proxy", action="store_true")
@@ -1884,6 +2207,14 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("status"); p.add_argument("--json", action="store_true")
     p.set_defaults(fn=lambda a: cmd_status(a))
     p = sub.add_parser("verify"); p.add_argument("--ws", action="store_true"); p.set_defaults(fn=cmd_verify)
+    p = sub.add_parser("prune-logs")
+    p.add_argument("--retention-hours", type=float, default=None,
+                   help=f"log window in hours (default config log_retention_hours, "
+                        f"else {LOG_RETENTION_HOURS_DEFAULT:g}); 0 keeps logs forever")
+    p.add_argument("--force", action="store_true", help="rotate now, ignoring the window")
+    p.add_argument("--quiet", action="store_true", help="only report through the exit code")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(fn=cmd_prune_logs)
     sub.add_parser("install-autostart").set_defaults(fn=cmd_install_autostart)
     p = sub.add_parser("teardown"); p.add_argument("--purge-project", action="store_true"); p.set_defaults(fn=cmd_teardown)
     return ap

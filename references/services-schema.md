@@ -10,8 +10,9 @@
   systemd/               # 渲染出的单元规范副本（/etc 里的是安装件）
   services/              # 演示与自带小服务代码（如 demo_origin.py）
   venv/                  # 项目 venv（websockets 等）
-  logs/                  # bridge.log / cloudflared.log / svc-<name>.log
+  logs/                  # bridge.log / cloudflared.log / svc-<name>.log（默认保留 1 天）
   run/managed-units.txt  # 当前受管 unit 名单，hook 保活按它巡检
+  run/log-retention.json # 上次日志滚动的时间戳（窗口靠它算，不靠 mtime）
 ```
 
 ## config.json 字段
@@ -25,6 +26,7 @@
 | `bridge_port` | 桥监听端口，默认 17844；同机多项目必须各用不同端口 |
 | `mode` | 可选：`bridge` / `direct` 强制模式；缺省由 doctor 逻辑自动判 |
 | `force_dns` | 可选，默认 false。true 时才允许改写「不是本工具建的」DNS 记录（等价于命令行 `--force-dns`） |
+| `log_retention_hours` | 可选，默认 24。日志窗口；`0` 表示不清理。见 SKILL.md「日志保留」 |
 
 ## services[] 每条字段
 
@@ -36,12 +38,23 @@
 | `health` | 本地/公网验活路径，默认 `/health`，必须以 `/` 开头 |
 | `auth` | `key`（默认，源站自校验共享密钥）或 `public`（裸奔，需 `--allow-public`） |
 | `public_confirmed` | 由 `add-service --auth public --allow-public` 写入；`up` 会复核它，手改 config 把 auth 改成 public 而不带上它会被拒绝 |
-| `origin` | 可选。ingress 的源站地址，默认 `http://127.0.0.1:<port>`；可写 `https://` / `tcp://` / `unix:` 前缀 |
+| `origin` | 可选。ingress 的源站地址，默认 `http://127.0.0.1:<port>`。浏览器可开的：`http://`、`https://`、`unix:/path.sock`；**裸 TCP**（`tcp://`、`ssh://`、`rdp://`）需要客户端跑 `cloudflared access`，注册时必须 `--allow-tcp-origin` |
+| `origin_request` | 可选，透传给 cloudflared 的 `originRequest`。**`https://` 源站必须能从中看出证书怎么验**（`originServerName` 或 `noTLSVerify`），否则 `up` 直接拒绝。常见键：`originServerName`、`noTLSVerify`、`caPool`、`httpHostHeader`、`http2Origin`；未列入白名单的键会被拒绝（避免拼错后成为一条被静默忽略的规则） |
+| `tcp_origin_confirmed` | 由 `add-service --allow-tcp-origin` 写入；`up` 复核它，手改 config 加 `tcp://` 而不带它会被拒绝 |
 | `start_cmd` | 可选。有它 → cfbridge 为该服务渲染 systemd unit 并托管进程；没有 → 只做路由，服务进程用户自理 |
 | `workdir` | start_cmd 的工作目录，默认项目目录 |
 | `env_proxy` | true 时给服务注入 `secrets/proxy.env`（服务需要经沙盒代理出网时用） |
 
 字段值一律不得包含换行（会破坏 unit 文件），CLI 与校验都会拦。
+
+### https 源站为什么会 502
+
+cloudflared 的 `originServerName` 为空时，用 **service URL 里的主机名**校验源站证书。`https://127.0.0.1:8443` 于是要求证书名字面是 `127.0.0.1`——自签证书必然失败，表现为隧道健康但每条请求 502。处理方式：
+
+- loopback（`127.0.0.1` / `::1` / `localhost`）：注册时自动补 `{"noTLSVerify": true}`（这一跳不出本机）。
+- 非 loopback：必须 `--origin-tls-name <证书里的名字>` 或显式 `--origin-no-verify`。
+- 私有 CA：`--origin-tls-name <名字> --origin-request '{"caPool": "/etc/ssl/certs/ca.crt"}'`，校验照常打开。
+- 手改 `config.json` 时如果只写了 `https://` 而没给 TLS 决定，`up` 会报错并提示该补哪个键。
 
 `start_cmd` 里若引用项目 venv（`<project>/venv/bin/python`），那个 venv 会被当成**显式依赖**：
 `doctor` 会把它列进 `dependencies:`，`up` / `doctor --fix` 发现它丢了会自动重建并装上
@@ -76,9 +89,11 @@ unit 名前缀是 `cfb-<项目目录名>-<路径哈希6位>`，例如 `cfb-mybri
 ```bash
 $CFB --project <proj> add-service --name blog --hostname blog.example.com --port 8080 \
      --start-cmd "/path/to/venv/bin/python app.py"   # 没有常驻命令就省略，只路由
-$CFB --project <proj> up        # 自愈依赖 → ingress、DNS、unit、按依赖顺序拉起、验活
+$CFB --project <proj> up        # 自愈依赖 → 日志保留 → ingress、DNS、unit、按依赖顺序拉起、验活
 $CFB --project <proj> verify    # 公网再验一层
 ```
+
+源站不是 loopback HTTP 时按「origin 与 TLS」选参数（`https://` 必须给证书名，裸 TCP 必须 `--allow-tcp-origin`）。
 
 不需要新隧道、不需要改桥、不需要动已有服务。同机第二个项目时注意 `bridge_port` 与各服务 `port` 不要撞
 （`up` 会自动顺延撞掉的 `bridge_port`）。

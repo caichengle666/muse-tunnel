@@ -27,6 +27,16 @@ mapfile -t UNITS < "$UNITS_FILE"
 mkdir -p "$PROJ/logs" "$PROJ/run" "$PROJ/secrets"
 chmod 700 "$PROJ/secrets" 2>/dev/null || true
 
+CFB="{{SKILL_BIN}}/cfbridge.py"
+
+# Enforce the log retention window on every poll. systemd appends raw
+# stdout into logs/ on the only persistent volume, so without this a
+# chatty service slowly fills $HOME and takes config.json/secrets with
+# it. One CLI call, idempotent, silent unless something was done.
+if [[ -f "$CFB" ]] && command -v python3 >/dev/null 2>&1; then
+  python3 "$CFB" --project "$PROJ" prune-logs --quiet >/dev/null 2>&1 || true
+fi
+
 # --- refresh proxy.env from env (contains proxy creds; 600 only) ---
 proxy_url="${HTTPS_PROXY:-${https_proxy:-}}"
 if [[ -n "$proxy_url" ]]; then
@@ -133,7 +143,6 @@ fi
 # venv, a missing cloudflared copy, a rotated proxy.env value or a
 # bridge port taken by another project all leave units installed and
 # crash-looping. doctor --fix covers those and starts what is down.
-CFB="{{SKILL_BIN}}/cfbridge.py"
 if [[ -f "$CFB" ]]; then
   fix_log="$PROJ/logs/last-doctor-fix.log"
   if python3 "$CFB" --project "$PROJ" doctor --fix >"$fix_log" 2>&1; then

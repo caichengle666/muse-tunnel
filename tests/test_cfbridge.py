@@ -113,11 +113,185 @@ class ValidateServiceTests(unittest.TestCase):
             cfbridge.validate_service(self.cfg, svc(health="health"), allow_public=False)
         with self.assertRaises(SystemExit):
             cfbridge.validate_service(self.cfg, svc(origin="ftp://127.0.0.1:21"), allow_public=False)
-        cfbridge.validate_service(self.cfg, svc(origin="https://127.0.0.1:8443"), allow_public=False)
+
+    def test_https_origin_must_carry_a_tls_decision(self):
+        # Bare https://127.0.0.1:8443 is the spelling the docs used to
+        # suggest: cloudflared then expects a certificate literally named
+        # "127.0.0.1", fails the handshake and answers 502 while the
+        # tunnel itself looks perfectly healthy. It must not pass.
+        with self.assertRaises(SystemExit):
+            cfbridge.validate_service(self.cfg, svc(origin="https://127.0.0.1:8443"), allow_public=False)
+        cfbridge.validate_service(
+            self.cfg,
+            svc(origin="https://127.0.0.1:8443", origin_request={"noTLSVerify": True}),
+            allow_public=False)
+        cfbridge.validate_service(
+            self.cfg,
+            svc(origin="https://origin.internal:8443",
+                origin_request={"originServerName": "origin.internal"}),
+            allow_public=False)
+
+    def test_non_loopback_https_origin_needs_a_certificate_name(self):
+        # normalize_origin() only defaults loopback; anywhere else the
+        # answer depends on a certificate we cannot inspect.
+        with self.assertRaises(SystemExit):
+            cfbridge.validate_service(self.cfg, svc(origin="https://10.0.0.5:8443"), allow_public=False)
+
+    def test_http_and_unix_origins_need_no_tls_decision(self):
+        cfbridge.validate_service(self.cfg, svc(origin="http://127.0.0.1:9001"), allow_public=False)
+        cfbridge.validate_service(self.cfg, svc(origin="unix:/run/app.sock"), allow_public=False)
+
+    def test_raw_tcp_origin_needs_explicit_confirmation(self):
+        with self.assertRaises(SystemExit):
+            cfbridge.validate_service(self.cfg, svc(origin="tcp://127.0.0.1:5432"), allow_public=False)
+        cfbridge.validate_service(
+            self.cfg,
+            svc(origin="tcp://127.0.0.1:5432", tcp_origin_confirmed=True),
+            allow_public=False)
+
+    def test_rejects_unknown_origin_request_keys(self):
+        # A typo would otherwise become a rule cloudflared silently ignores.
+        with self.assertRaises(SystemExit):
+            cfbridge.validate_service(
+                self.cfg, svc(origin_request={"originServername": "typo"}), allow_public=False)
+
+    def test_rejects_newline_in_origin_request_value(self):
+        with self.assertRaises(SystemExit):
+            cfbridge.validate_service(
+                self.cfg, svc(origin_request={"originServerName": "a\nb"}), allow_public=False)
 
     def test_rejects_newlines_that_would_inject_unit_directives(self):
         with self.assertRaises(SystemExit):
             cfbridge.validate_service(self.cfg, svc(start_cmd="/bin/true\nUser=nobody"), allow_public=False)
+
+
+class OriginTests(unittest.TestCase):
+    def test_origin_host(self):
+        self.assertEqual(cfbridge.origin_host("https://127.0.0.1:8443"), "127.0.0.1")
+        self.assertEqual(cfbridge.origin_host("unix:/run/app.sock"), "")
+        self.assertEqual(cfbridge.origin_host(""), "")
+
+    def test_normalize_defaults_loopback_https_to_no_verify(self):
+        s = svc(origin="https://127.0.0.1:8443")
+        self.assertTrue(cfbridge.normalize_origin(s))
+        self.assertEqual(s["origin_request"], {"noTLSVerify": True})
+
+    def test_normalize_is_idempotent(self):
+        s = svc(origin="https://127.0.0.1:8443")
+        cfbridge.normalize_origin(s)
+        self.assertFalse(cfbridge.normalize_origin(s))
+
+    def test_normalize_leaves_an_explicit_decision_alone(self):
+        s = svc(origin="https://127.0.0.1:8443", origin_request={"originServerName": "app.local"})
+        self.assertFalse(cfbridge.normalize_origin(s))
+        self.assertNotIn("noTLSVerify", s["origin_request"])
+
+    def test_normalize_leaves_non_loopback_and_plain_http_alone(self):
+        remote = svc(origin="https://10.0.0.5:8443")
+        self.assertFalse(cfbridge.normalize_origin(remote))
+        self.assertNotIn("origin_request", remote)
+        self.assertFalse(cfbridge.normalize_origin(svc(origin="")))
+
+    def test_parse_origin_request(self):
+        self.assertEqual(cfbridge.parse_origin_request(""), {})
+        self.assertEqual(cfbridge.parse_origin_request('{"noTLSVerify": true}'),
+                         {"noTLSVerify": True})
+        for bad in ("not json", "[1,2]", '{"bogusKey": 1}'):
+            with self.assertRaises(SystemExit):
+                cfbridge.parse_origin_request(bad)
+
+
+class AddServiceCliTests(unittest.TestCase):
+    """What the CLI records for an origin, incl. the TLS decision."""
+
+    def _project(self) -> str:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        cfbridge.ensure_project_layout(tmp.name)
+        cfbridge.save_config(tmp.name, {"zone": "example.com", "tunnel_name": "t",
+                                        "account_id": "", "bridge_port": 17844,
+                                        "services": []})
+        return tmp.name
+
+    def _add(self, proj: str, *argv: str) -> dict:
+        args = cfbridge.build_parser().parse_args(["--project", proj, "add-service", *argv])
+        args.fn(args)
+        return cfbridge.load_config(proj)["services"][-1]
+
+    def test_loopback_https_origin_defaults_to_skipping_verification(self):
+        svc = self._add(self._project(),
+                        "--name", "app", "--hostname", "app.example.com", "--port", "8080",
+                        "--origin-url", "https://127.0.0.1:8443")
+        self.assertEqual(svc["origin_request"], {"noTLSVerify": True})
+
+    def test_non_loopback_https_origin_requires_a_decision(self):
+        with self.assertRaises(SystemExit):
+            self._add(self._project(),
+                      "--name", "app", "--hostname", "app.example.com", "--port", "8080",
+                      "--origin-url", "https://10.0.0.5:8443")
+
+    def test_origin_tls_name_is_recorded_for_non_loopback(self):
+        svc = self._add(self._project(),
+                        "--name", "app", "--hostname", "app.example.com", "--port", "8080",
+                        "--origin-url", "https://10.0.0.5:8443",
+                        "--origin-tls-name", "app.internal")
+        self.assertEqual(svc["origin_request"], {"originServerName": "app.internal"})
+
+    def test_origin_tls_name_needs_an_https_origin(self):
+        with self.assertRaises(SystemExit):
+            self._add(self._project(),
+                      "--name", "app", "--hostname", "app.example.com", "--port", "8080",
+                      "--origin-tls-name", "app.internal")
+
+    def test_origin_request_json_is_merged(self):
+        svc = self._add(self._project(),
+                        "--name", "app", "--hostname", "app.example.com", "--port", "8080",
+                        "--origin-url", "https://10.0.0.5:8443",
+                        "--origin-tls-name", "app.internal",
+                        "--origin-request", '{"caPool": "/etc/ssl/private-ca.pem"}')
+        self.assertEqual(svc["origin_request"],
+                         {"originServerName": "app.internal", "caPool": "/etc/ssl/private-ca.pem"})
+
+    def test_plain_http_origin_records_no_origin_request(self):
+        svc = self._add(self._project(),
+                        "--name", "app", "--hostname", "app.example.com", "--port", "8080")
+        self.assertEqual(svc["origin_request"], {})
+        self.assertEqual(svc["origin"], "")
+
+    def test_raw_tcp_origin_needs_confirmation(self):
+        with self.assertRaises(SystemExit):
+            self._add(self._project(),
+                      "--name", "db", "--hostname", "db.example.com", "--port", "5432",
+                      "--origin-url", "tcp://127.0.0.1:5432")
+        svc = self._add(self._project(),
+                        "--name", "db", "--hostname", "db.example.com", "--port", "5432",
+                        "--origin-url", "tcp://127.0.0.1:5432", "--allow-tcp-origin")
+        self.assertTrue(svc["tcp_origin_confirmed"])
+
+
+class PruneLogsCliTests(unittest.TestCase):
+    def test_cli_prunes_and_reports_json(self):
+        import contextlib
+        import io
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        proj = tmp.name
+        os.makedirs(os.path.join(proj, "logs"))
+        os.makedirs(os.path.join(proj, "run"))
+        with open(os.path.join(proj, "logs", "cloudflared.log"), "wb") as f:
+            f.write(b"x" * (2 * 1024 * 1024))   # over the default tail, so it rotates
+        args = cfbridge.build_parser().parse_args(
+            ["--project", proj, "prune-logs", "--retention-hours", "24", "--json"])
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            args.fn(args)
+        report = json.loads(buf.getvalue())
+        self.assertEqual(report["retention_hours"], 24)
+        self.assertTrue(any("rotated cloudflared.log" in a for a in report["actions"]),
+                        report)
+        self.assertEqual(os.path.getsize(os.path.join(proj, "logs", "cloudflared.log")),
+                         cfbridge.LOG_TAIL_BYTES_DEFAULT)
+        self.assertTrue(os.path.exists(cfbridge.log_retention_state_path(proj)))
 
 
 class RenderTests(unittest.TestCase):

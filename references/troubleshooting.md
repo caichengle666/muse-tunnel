@@ -32,6 +32,12 @@
 | 重启后服务 unit 反复重启、日志报 `No such file or directory: .../venv/bin/python` | `logs/svc-<name>.log` | 服务 venv 没建或被清（以前只有 `init` 会建） | `up` / `doctor --fix` 会自动重建 venv 并装 `websockets>=12,<16`；服务需要别的依赖就自己装进同一个 venv |
 | cloudflared 进程是 active 但公网 1033 | 日志尾部有没有 `Registered tunnel connection` | 「进程活着」不等于「隧道注册上了」 | `doctor --fix` 会把这种状态判为不健康并重启 cloudflared；`up` 也只在看到注册日志后才算起来 |
 | 保活 hook 报 recovered via doctor --fix | 项目 `logs/last-doctor-fix.log` | hook 修好的是依赖层问题（venv/cloudflared/端口/proxy.env），不是网络恢复 | 看那份日志确认修了什么；同类问题反复出现说明依赖在持续丢（比如 /home 之外放了东西），按日志里的项从根上修 |
+| 隧道健康（日志有 `Registered`）、公网却每条请求 502 | 源站是 `https://` 吗 | **originServerName 为空时 cloudflared 拿 service URL 的主机名当证书名**，`https://127.0.0.1:8443` 要求证书叫 `127.0.0.1` | 重新 `add-service --origin-tls-name <证书里的名字>`；loopback 自签直接 `--origin-no-verify`（注册时 loopback 会自动这么设）；私有 CA 加 `--origin-request '{"caPool":"..."}'`。手改 config 也会被 `up` 拦下并提示补哪个键 |
+| `add-service` 报 `origin ... is raw TCP stream` | — | `tcp://` / `ssh://` / `rdp://` 是裸 TCP，浏览器打不开 | 确认确实要挂：加 `--allow-tcp-origin`，然后告诉用户客户端得起 `cloudflared access tcp --hostname <host> --url 127.0.0.1:<port>`。要浏览器直开就用 `http://` 或 `unix:` 源站 |
+| 磁盘/家目录被日志占满 | `du -sh <项目>/logs/*` | 日志原本没有上限，而项目目录是唯一持久卷 | `up` 与保活 hook 现在每轮都跑保留策略（默认 1 天窗口、单文件 8 MiB 上限、清掉已移除服务的日志）；想立刻回收 `prune-logs --force`，改窗口用 `config.json` 的 `log_retention_hours` 或 `prune-logs --retention-hours N`（0 = 不清理） |
+| 日志「滚动了」但文件还在长，或出现看不见的占空间 | `ls -l logs/`、`df` | 有人把原地截断改成了 rename —— systemd 的 `append:` 握着 fd 继续往旧 inode 写，新文件不会收到数据 | 改回 `rotate_log_in_place`（原地 O_TRUNC）。这是硬约束，见 SKILL.md「日志保留」 |
+| 账号里隧道很多时 `up` 建出第二条同名隧道 | `cfbridge` 的 POST 日志 | 旧版本列表不分页，第 2 页之后的同名隧道看不见 | 已改为按 `result_info.total_pages` 翻页；若已存在重复隧道，去 dashboard 删掉多余那条（隧道名在账号内不唯一，Cloudflare 不拦） |
+| `up` 报 `POST ... transport error` 但隧道其实建好了 | dashboard 隧道列表 | POST 非幂等：响应丢了但请求生效了 | 这是预期行为（不让重试掩盖已生效的写）；`ensure_tunnel` 会回读列表认领已建成的隧道，直接重跑 `up` 即可 |
 
 原则：一次只改一个变量，改完必跑 `status` + `verify` 复验；失败层级（凭据 / 隧道注册 / ingress / DNS / 源站 / 鉴权）分开报，不要笼统说“隧道有问题”。
 
@@ -44,8 +50,14 @@ python3 -m unittest discover -s tests -v
 ```
 
 覆盖：CONNECT 响应解析与前缀字节、拼接的双向大流量/半关闭/空闲超时/对端突然关闭、
-边缘竞速的胜者与败者回收、DNS 归属保护、ingress origin、API 重试、
-服务注册表校验（含 zone 边界与换行注入）、模板渲染与 unit 命名唯一性。
+边缘竞速的胜者与败者回收、DNS 归属保护、ingress origin 与 originRequest、API 分页遍历、
+API 重试策略（幂等可重试、POST 只在 429 重试）、`ensure_tunnel` 认领已建成的隧道、
+服务注册表校验（zone 边界、换行注入、public/裸 TCP 确认、origin TLS 决定）、
+模板渲染与 unit 命名唯一性。
+
+日志保留（`tests/test_logs.py`）另有一组：尺寸上限与「只留尾部」、**原地截断且 fd 仍可追加**、
+窗口到期才滚动（首轮先滚一次把历史输出收进上限）、`--force`、`retention_hours=0` 关闭、
+陈旧日志按 mtime 清理而受管日志不按 mtime 删、状态文件损坏时的退化行为。
 
 依赖层（`tests/test_deps.py`）另有一组：代理 URL 解析与脱敏（不许泄漏凭据）、
 代理探活（含 SOCKS 被拒、不可达、无法解析三种负例）、经代理 CONNECT 到边缘的成功与 403、

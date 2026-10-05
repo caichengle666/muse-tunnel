@@ -18,17 +18,20 @@ CFB="python3 ~/workspace/skills/cf-tunnel-bridge/bin/cfbridge.py"
 $CFB --project ~/workspace/projects/<proj> doctor [--fix]   # 依赖体检 + 模式判定（--json 可机读，--fix 顺手修）
 $CFB --project ~/workspace/projects/<proj> init --zone example.com --tunnel-name <name>
 $CFB --project ~/workspace/projects/<proj> add-service --name files --hostname files.example.com --port 8080 \
-     [--origin-url https://127.0.0.1:8443] [--start-cmd "..."] [--auth key|public --allow-public]
+     [--origin-url https://127.0.0.1:8443 --origin-tls-name <cert name>] \
+     [--origin-request '{"caPool": "..."}'] [--allow-tcp-origin] \
+     [--start-cmd "..."] [--auth key|public --allow-public]
 $CFB --project ~/workspace/projects/<proj> demo --hostname demo.example.com   # 自带密钥鉴权的 WS 演示服务
-$CFB --project ~/workspace/projects/<proj> up [--force-dns]  # 自愈依赖 → 建隧道+DNS → 装 systemd → 按依赖顺序拉起并验活
+$CFB --project ~/workspace/projects/<proj> up [--force-dns]  # 自愈依赖 → 日志保留 → 建隧道+DNS → 装 systemd → 按依赖顺序拉起并验活
 $CFB --project ~/workspace/projects/<proj> status [--json]   # 单元状态 + 本地/公网 health
 $CFB --project ~/workspace/projects/<proj> verify [--ws]     # 公网端到端验证（含“无密钥必须被拒”）
+$CFB --project ~/workspace/projects/<proj> prune-logs [--retention-hours N|--force]  # 日志保留策略（默认 1 天）
 $CFB --project ~/workspace/projects/<proj> install-autostart # 渲染保活 hook 脚本并打印注册步骤
 $CFB --project ~/workspace/projects/<proj> down             # 停服务（隧道/DNS 保留）
 $CFB --project ~/workspace/projects/<proj> teardown [--purge-project]  # 删隧道+DNS（+可选删项目）
 ```
 
-`up` / `down` / `teardown` 需要 root（要写 `/etc/systemd/system`）；`doctor` / `status` / `verify` 不需要。
+`up` / `down` / `teardown` 需要 root（要写 `/etc/systemd/system`）；`doctor` / `status` / `verify` / `prune-logs` 不需要。
 
 项目目录结构、服务注册表字段和鉴权语义见 `references/services-schema.md`；故障对照见 `references/troubleshooting.md`。
 
@@ -52,6 +55,37 @@ $CFB --project ~/workspace/projects/<proj> teardown [--purge-project]  # 删隧�
 
 修不了的（无 root、无 systemd、代理真的挂了）会明说是哪一类、为什么修不了，不假装成功。保活 hook 在重启后若发现 stack 不健康，也会调用 `doctor --fix` 兜底（日志落在项目 `logs/last-doctor-fix.log`）。
 
+## 日志保留（默认 1 天）
+
+三个 unit 的 stdout 都 `append:` 进项目 `logs/`，而项目目录是唯一持久卷——接管了 stdout 就得负责给它定上限，否则用户程序一啰嗦就能把 `config.json` 和 `secrets/` 一起写坏。
+
+`up` 和保活 hook 每轮巡检都会跑一次保留策略（`prune-logs`，幂等、无输出即无事）：
+
+| 情况 | 动作 |
+|---|---|
+| 单文件超过 8 MiB | 立刻原地截断，只留最后 1 MiB |
+| 距上次滚动满 1 天 | 所有受管日志滚动一次（只留尾部，保留崩溃现场） |
+| 属于已移除服务的日志，且 1 天没被写过 | 删除 |
+
+三条实现要点，改动前务必想清楚：
+
+1. **必须原地截断，不能 rename**。systemd 的 `append:` 握着 fd 一直往它打开的那个 inode 追加；rename 只会让活动日志变成看不见、还在长的孤儿文件。
+2. **日志里没有时间戳**（raw stdout），所以「内容有多旧」问不出来，窗口靠 `run/log-retention.json` 记的滚动时间戳来保证，不是靠 mtime。
+3. **受管日志永不按 mtime 删**：正在被写的文件 mtime 永远新鲜，而安静了一天的 `cloudflared.log` 恰恰是最该留下的证据。
+
+窗口可用 `config.json` 的 `log_retention_hours` 或 `prune-logs --retention-hours N` 调整；`0` 表示不清理。用户抱怨日志占空间时先给窗口，再考虑 `--force` 立刻滚一次。
+
+## origin（源站）与 TLS
+
+默认源站是 `http://127.0.0.1:<port>`，不需要额外说明。其余情况有个**必踩的坑**：cloudflared 在 `originServerName` 为空时，会用 **service URL 里的主机名**去校验源站证书。所以 `--origin-url https://127.0.0.1:8443` 等于要求证书名字面是 `127.0.0.1`——自签证书必然失败，**隧道看着完全健康，但每条请求都是 502**。
+
+规则：
+
+- `https://` + loopback（`127.0.0.1` / `::1` / `localhost`）：自动 `noTLSVerify`（这一跳不出本机，会打印一行 note）。想真校验就加 `--origin-tls-name`。
+- `https://` + 非 loopback：**必须**给 `--origin-tls-name <证书里的名字>` 或 `--origin-no-verify`；两者都没有直接拒绝注册。私有 CA 不必关校验，用 `--origin-request '{"caPool": "/path/ca.crt"}'`。
+- `unix:/path/to.sock`：HTTP 语义，浏览器可开。
+- `tcp://` / `ssh://` / `rdp://`：**裸 TCP，浏览器打不开**，客户端得起 `cloudflared access tcp --hostname <host> --url 127.0.0.1:<port>`。注册时必须加 `--allow-tcp-origin`，别让用户以为挂上去就能用浏览器访问。
+
 ## Auth
 
 - Cloudflare 凭据只从两个来源读：已连接的 `custom.cloudflare` connector（经 surrogate 助手，值不进日志/文件），或环境变量 `CF_API_TOKEN`。两者都没有时停下来让用户先接 connector，不要让用户在聊天里贴 token。
@@ -70,8 +104,8 @@ $CFB --project ~/workspace/projects/<proj> teardown [--purge-project]  # 删隧�
 
 1. **先诊断**：跑 `doctor`。输出 `mode=bridge` → 桥必需（本沙盒常态）；`mode=direct` → 跳过桥。doctor 里 `cf` 一项报错 → 先解决凭据，不继续。底部 `dependencies:` 里任何 `MISSING` 都要处理：`doctor --fix` 能修的直接修，修不了的当面告诉用户缺什么。退出码 1 就代表还有 required 依赖没满足，别把它当成正常输出略过。
 2. **建项目**：`init --zone <用户域名>`。项目必须在 `~/workspace/` 下（只有家目录持久）；用户给了别的路径先提醒再确认。
-3. **注册服务**：每要挂一个服务就 `add-service` 一条；只需要验链路就先 `demo` 注册演示服务。服务有自己的启动命令才加 `--start-cmd`；已经在端口上跑着的服务只注册路由、不接管进程。源站不是 `http://127.0.0.1:<port>` 时用 `--origin-url`。
-4. **拉起**：`up`。它依次做：校验注册表 → **自愈依赖（缺什么补什么，输出 `fixed:` 行）** → 体检并拦下仍缺失的必需依赖 → 建/复用命名隧道并写 ingress → 建 DNS（遇他人记录会停下）→ 渲染并安装 systemd 单元 → 按桥→服务→cloudflared 顺序启动、每层等就绪 → 本地验活。任一步失败看输出停在哪一层，对照 troubleshooting，不要换花样重试。
+3. **注册服务**：每要挂一个服务就 `add-service` 一条；只需要验链路就先 `demo` 注册演示服务。服务有自己的启动命令才加 `--start-cmd`；已经在端口上跑着的服务只注册路由、不接管进程。源站不是 `http://127.0.0.1:<port>` 时按上面「origin 与 TLS」那节选参数——`https://` 源站必须交代证书怎么验，`tcp://` 之类必须显式确认，否则注册会被拒绝。
+4. **拉起**：`up`。它依次做：校验注册表 → **自愈依赖（缺什么补什么，输出 `fixed:` 行）** → 体检并拦下仍缺失的必需依赖 → **执行日志保留策略（输出 `logs:` 行）** → 建/复用命名隧道并写 ingress → 建 DNS（遇他人记录会停下）→ 渲染并安装 systemd 单元 → 按桥→服务→cloudflared 顺序启动、每层等就绪 → 本地验活。任一步失败看输出停在哪一层，对照 troubleshooting，不要换花样重试。
 5. **验公网**：`verify --ws`（带 WS 的服务）。分层报告：本地 health、公网 health、WS 三档（无密钥应被关、正确密钥 greeting/echo 通）。哪层没过就说哪层，不许含糊报“通了”。
 6. **装保活**：`install-autostart` 渲染 hook 脚本后，按它打印的步骤用 hooks 工具 `add → dry_run → enable`。dry_run 期望 silent/healthy；不 healthy 先修服务再 enable。
 7. **交付报告**：域名、每个服务的子域名与鉴权方式、保活状态（systemd + hook 是否 enable）、重启恢复方式（一句“沙盒重建后 hook 约 1 分钟内自动装回”），以及密钥文件在哪（只说路径，不给值）。
@@ -102,4 +136,6 @@ cloudflared 二进制一旦落到项目 `bin/` 就被长期复用，所以默认
 8. 共享密钥只走 `X-Bridge-Key` 请求头，不要放进 URL query（query 会进 Cloudflare 与源站的访问日志）。`verify` 已经按这个约定实现。
 9. 缺依赖时的顺序是「先自愈再报告」，不是「重试」也不是让用户手动补：`up` / `doctor --fix` 覆盖了工具自己该负责的那几项；仍缺的必须说清是哪一项、为什么修不了（无 root / 无 systemd / 代理真的挂了）。禁止用「多试几次」掩盖依赖缺失。
 10. 代理 URL 里含凭据：任何输出（包括 `fixed:` 行、日志、交给 hook 的 prompt）都只允许出现脱敏后的 `http://***@host:port`，不要把完整代理 URL 或密钥打进聊天。
+11. 源站安全默认不可退让：`https://` 源站没给出证书名就不许注册（别擅自替用户关校验）；`tcp://` / `ssh://` / `rdp://` 必须 `--allow-tcp-origin` 并当面说清「浏览器打不开，客户端要跑 cloudflared access」。用户报「隧道通了但公网 502」时，先查 origin 是不是这些坑，再怀疑隧道。
+12. 日志保留策略只允许原地截断，禁止改成 rename/删除活动日志。要动 `prune_logs`、`rotate_log_in_place` 或 hook 里那段调用，先读上面「日志保留」三条实现要点。
 

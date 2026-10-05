@@ -58,7 +58,31 @@ $CFB --project $PROJ add-service --name files --hostname files.example.com --por
 $CFB --project $PROJ up
 ```
 
-源站不在 `http://127.0.0.1:<port>` 时加 `--origin-url https://127.0.0.1:8443`（也支持 `tcp://`、`unix:`）。
+源站不是 `http://127.0.0.1:<port>` 时用 `--origin-url`，但 HTTPS 源站必须同时交代「证书怎么验」——cloudflared 在 `originServerName` 为空时会拿 **service URL 里的主机名**去校验源站证书，所以 `https://127.0.0.1:8443` 要求证书名字面就是 `127.0.0.1`，自签证书必然握手失败、每条请求都 502（而隧道本身看着完全健康）。
+
+```bash
+# HTTPS + loopback：这一跳不出本机，自动 noTLSVerify（会打印一行 note）
+$CFB --project $PROJ add-service --name app --hostname app.example.com --port 8443 \
+     --origin-url https://127.0.0.1:8443
+
+# HTTPS + 非 loopback：必须给出证书名，否则直接拒绝注册
+$CFB --project $PROJ add-service --name app --hostname app.example.com --port 8443 \
+     --origin-url https://10.0.0.5:8443 --origin-tls-name app.internal
+
+# 私有 CA 也不用关校验：证书名 + CA 池一起给
+$CFB --project $PROJ add-service --name app --hostname app.example.com --port 8443 \
+     --origin-url https://10.0.0.5:8443 --origin-tls-name app.internal \
+     --origin-request '{"caPool": "/etc/ssl/certs/internal-ca.crt"}'
+
+# Unix socket（HTTP 语义，浏览器可开）
+$CFB --project $PROJ add-service --name app --hostname app.example.com --port 8080 \
+     --origin-url unix:/run/app.sock
+
+# 裸 TCP（tcp:// / ssh:// / rdp://）：浏览器打不开，客户端必须跑 cloudflared access，
+# 所以要显式确认，避免以为挂上去就能用浏览器访问
+$CFB --project $PROJ add-service --name db --hostname db.example.com --port 5432 \
+     --origin-url tcp://127.0.0.1:5432 --allow-tcp-origin
+```
 
 ## 自测
 
@@ -78,7 +102,10 @@ python3 -m unittest discover -s tests -v
 - **自动拉起三层**：systemd `Restart=always` 兜进程崩溃；规范副本兜 /etc 被清；保活 hook 兜沙盒重建，约一分钟自动恢复（hook 自己修不动时会调用 `doctor --fix` 兜底）。
 - **凭据卫生**：令牌只从 connector 或环境变量读，永不写进代码与仓库；写进项目的密钥文件一律 600 且被 .gitignore 排除；代理 URL 打印前一律脱敏成 `http://***@host:port`。
 - **不动别人的 DNS**：本工具建的记录带 `cf-tunnel-bridge managed` 注释，`up`/`teardown` 只碰自己建的或已指向本隧道的记录；目标子域名上有他人记录时直接报错停下，需显式 `--force-dns` 才覆盖。
+- **日志有上限，默认留 1 天**：三个 unit 的 stdout 都 `append:` 进项目 `logs/`，而那是唯一持久卷——用户程序一啰嗦就能把 `config.json` 和 `secrets/` 一起写坏。`up` 和保活 hook 每轮都跑保留策略：到窗口就滚动、单文件超上限就截尾、被移除服务的日志按 mtime 清掉。滚动是**原地截断**（systemd 握着 fd 往原 inode 追加，rename 会把活动日志变成看不见的孤儿文件）。窗口改 `config.json` 的 `log_retention_hours`，或 `cfbridge prune-logs --retention-hours N`（0 = 不清理）。
 - **可复现的二进制**：cloudflared 默认锁版本下载（而非 `latest`），可用 `CFBRIDGE_CLOUDFLARED_SHA256` 强制校验和；落盘前做体积 + ELF + 实际运行三重校验。
+- **列表接口分页遍历**：账号 / 隧道 / DNS 记录都按 `result_info.total_pages` 翻页——列表被截断不只是「少看见几条」，它会让 `ensure_tunnel` 以为隧道不存在又建一条同名的。
+- **不盲目重试非幂等请求**：POST 只在 429（确定没执行）时重试；5xx 与传输超时对 POST 是「可能已经生效」，直接抛出，由 `ensure_tunnel` 回读列表去认领，而不是再造一条。
 
 ## 环境变量
 
@@ -94,8 +121,8 @@ python3 -m unittest discover -s tests -v
 
 ```
 SKILL.md            给 agent 的执行清单（条件 → 动作）
-bin/cfbridge.py     确定性 CLI：doctor(--fix)/init/add-service/demo/up/status/verify/down/install-autostart/teardown
-                    含依赖体检与自愈层（代理探活、venv/cloudflared/端口/单元修复）
+bin/cfbridge.py     确定性 CLI：doctor(--fix)/init/add-service/demo/up/status/verify/prune-logs/down/install-autostart/teardown
+                    含依赖体检与自愈层（代理探活、venv/cloudflared/端口/单元修复）与日志保留策略
 bin/edge_bridge.py  边缘桥（DoH 发现 + CONNECT 竞速 + 裸 TCP 拼接）
 bin/cf_api.py       Cloudflare API 最小客户端（凭据解析、DNS 归属校验、重试）
 templates/          systemd 单元、保活 hook、密钥鉴权演示服务

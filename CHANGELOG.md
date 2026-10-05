@@ -1,5 +1,75 @@
 # CHANGELOG
 
+## 未发布 — 日志保留、源站 TLS、API 纪律
+
+针对「这个功能还需要完善什么」的四项（外加一项按用户要求不动）：
+
+### 日志保留：默认 1 天
+
+原来三个 unit 的 stdout 都是 `StandardOutput=append:<项目>/logs/*.log`，没有任何轮转或上限，
+而项目目录是这类沙盒**唯一持久化**的地方。风险最大的是 `svc-<name>.log`——它接管的是用户自己
+程序的 stdout，刷屏就能写满家目录，把 `config.json` 和 `secrets/` 一起写坏。
+
+新增 `prune_logs()`（`up` 与保活 hook 每轮调用一次，配合新的 `prune-logs` 子命令）：
+
+- **窗口**（默认 24h，`config.json` 的 `log_retention_hours` 或 `--retention-hours`；`0` = 不清理）：
+  距上次滚动满一个窗口就把受管日志各滚一次，于是每个文件最多承载一个窗口的写入量。时间戳记在
+  `run/log-retention.json`，因为 systemd 追加的是**没有时间戳的原始 stdout**，「内容有多旧」问不出来。
+- **尺寸上限**（8 MiB，截到尾部 1 MiB）：防一次刷屏撑爆持久卷。
+- **陈旧清理**：不属于当前受管单元、且一个窗口没被写过的日志（被移除服务的残留）直接删除。
+
+`rotate_log_in_place()` **原地截断，绝不 rename**：systemd 的 `append:` 握着 fd 一直往它打开的那个
+inode 追加，rename 会让活动数据继续堆在无目录项指向的旧 inode 上（`df` 涨、`du` 不涨）。
+保留尾部而不是清空，是为了留住崩溃现场。受管日志永远不按 mtime 删除——安静下来的 `cloudflared.log`
+恰恰是最该留下的证据。
+
+### 修：`--origin-url https://...` 照文档敲会 502
+
+`set_ingress()` 只填 `service` 不填 `originRequest`，而 cloudflared 在 `originServerName` 为空时
+用 **service URL 里的主机名**校验源站证书——`https://127.0.0.1:8443` 要求证书字面叫 `127.0.0.1`，
+自签或没有 IP SAN 就直接失败，表现为**隧道看着完全健康、每条请求都是 502**。而 README/SKILL 给的
+示例恰好就是这个写法。
+
+现在 https 源站必须有明确的 TLS 决定：
+
+- loopback（`127.0.0.1`/`::1`/`localhost`）：自动补 `noTLSVerify`（这一跳不出本机），并打印说明；
+- 非 loopback：必须 `--origin-tls-name <证书里的名字>` 或显式 `--origin-no-verify`，否则拒绝注册；
+- 私有 CA：`--origin-request '{"caPool": "..."}'` 配合 `--origin-tls-name`，校验照常打开；
+- 手改 `config.json` 漏了这一步时 `up` 也会拦下并提示补哪个键（`normalize_origin()` 只会替 loopback 兜底）。
+
+`origin_request` 只接受白名单键，拼错的键被拒绝而不是静默变成一条不生效的规则。
+
+### 修：文档宣称 `tcp://` 源站可用会误导
+
+命名隧道 + 公开 hostname 的 `tcp://` / `ssh://` / `rdp://` ingress 是裸 TCP，**浏览器打不开**，
+客户端必须跑 `cloudflared access tcp --hostname <host> --url ...`（`unix:/path.sock` 是 HTTP 语义，
+不在其列）。现在注册裸 TCP 源站需要 `--allow-tcp-origin` 显式确认，注册成功也会打印这句说明；
+`up` 复核 `tcp_origin_confirmed`，手改 config 绕不过去。
+
+### 修：列表接口不分页
+
+`list_accounts` / `list_tunnels` / DNS 查询都固定 `per_page=50` 且不看 `result_info`。列表被截断
+会导致 `ensure_tunnel()` 看不见第 2 页的同名隧道从而**再建一条**（Cloudflare 不强制隧道名唯一），
+DNS 归属判断也会漏看记录。新增 `_get_paged()` 按 `total_pages` 翻页（无 `result_info` 时退化为
+「短页即末页」），四个调用点全部改用它。
+
+### 修：非幂等请求盲目重试
+
+`api()` 原来对所有方法一视同仁地重试，包括建隧道的 POST 和建 DNS 记录的 POST。对非幂等请求：
+
+- **429**：请求根本没执行，任何方法都可重试；
+- **5xx / 传输超时**：可能就是已经生效了，直接抛出。`ensure_tunnel()` 会回读列表认领已建成的
+  隧道，而不是再造一条。
+
+### 测试与文档
+
+新增 `tests/test_logs.py`（19 项，含「原地截断后 systemd 的 append fd 仍能继续写入」这条关键不变量）、
+`test_cf_api.py` 增加分页与非幂等重试用例、`test_cfbridge.py` 增加 origin/CLI 用例。
+SKILL.md 增加「日志保留」与「origin 与 TLS」两节，README、references 三篇、`services-schema.md`
+同步；CI 不变。
+
+> 按用户要求，systemd 单元的加固指令（`NoNewPrivileges` / `ProtectSystem` 等）**未改动**。
+
 ## 未发布 — CI 首跑修复（Linux 上暴露的两个问题）
 
 上一批改动推上去后 CI 在 3.10/3.12/3.13 上全红。查下来是两个独立问题，其中一个是真回归。

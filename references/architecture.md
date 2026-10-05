@@ -82,6 +82,39 @@ proxy (沙盒共享代理, secrets/proxy.env 是 unit 唯一的来源)
 
 Tunnel 前身是 Argo Tunnel，所以 CNAME 目标仍是 `<id>.cfargotunnel.com`、edge 主机名仍是 `region*.v2.argotunnel.com`。与现在另售的 Argo Smart Routing（付费加速）无关，本方案没有也不需要它。
 
+## 日志与保留窗口
+
+三个 unit 的 stdout 都写成 `StandardOutput=append:<项目>/logs/*.log`，而项目目录是唯一持久卷。
+工具接管了 stdout，就得给这些文件定上限：否则用户程序刷屏会写满家目录，把 `config.json` 和
+`secrets/` 一起弄坏。默认策略是**保留 1 天**，由 `up` 与保活 hook 每轮调用 `prune_logs()`。
+
+三个必须理解的点：
+
+1. **日志里没有时间戳**——systemd 追加的是程序原始 stdout。所以「这段内容有多旧」是问不出来的，
+   窗口只能靠 `run/log-retention.json` 里记的滚动时间戳来量化：距上次滚动满一个窗口，就把所有
+   受管日志滚一次，于是每个文件最多承载一个窗口的写入量。
+2. **滚动必须原地截断，不能 rename**。systemd 握着 append fd，写入目标是它当初打开的 inode；
+   rename 只会让新的小文件「看起来干净」，而活动数据继续堆在那个已经没有被目录项指向的旧 inode 上，
+   `df` 涨、`du` 不涨——最难查的一类磁盘问题。原地 `O_TRUNC` 重写同一 inode 则天然安全（O_APPEND
+   每次写前都会重新 seek 到末尾）。
+3. **窗口是结构性的，不是按 mtime 删**。正在写的文件 mtime 永远新鲜，按 mtime 删根本删不掉；
+   而一个安静下来的 `cloudflared.log` 恰恰是最该留下的证据。所以 mtime 只用来清理**不属于当前受管
+   单元**的遗留文件（被移除服务的日志），受管日志只滚动不删除。另外单独有一条尺寸闸：单文件超过
+   8 MiB 立刻截到尾部 1 MiB，防止一次刷屏就撑爆。
+
+滚动保留尾部而不是清空，是为了留住崩溃现场。窗口可通过 `config.json` 的 `log_retention_hours`
+或 `prune-logs --retention-hours N` 调整，`0` 表示不清理。
+
+## 与 Cloudflare API 交互的两条纪律
+
+- **列表必须翻页**。账号、隧道、以及按名字查 DNS 记录都按 `result_info.total_pages` 走完。
+  列表被截断不是「少看见几条」这么轻：`ensure_tunnel()` 按名复用隧道，看不见第 2 页的同名隧道
+  就会再建一条（Cloudflare 不强制隧道名唯一），随后按名取用还会拿到不确定的那条；DNS 归属判断
+  漏看记录则可能把别人的记录当成「不存在」。
+- **重试要认方法**。GET/PUT/DELETE 幂等，429/5xx 与传输错误都值得重试；POST/PATCH 不是：
+  5xx 和传输超时都是「可能已经生效」，重试就是重复建隧道、重复建 DNS 记录。所以非幂等请求只在
+  429（请求根本没执行）时重试，其余情况抛出，由 `ensure_tunnel()` 回读列表去认领已经落地的结果。
+
 ## 信任边界与安全姿态
 
 - **桥不解密**：TLS 由 cloudflared 与 edge 端到端完成，桥只搬裸 TCP 字节，看不到隧道内容与凭据。
@@ -98,6 +131,13 @@ Tunnel 前身是 Argo Tunnel，所以 CNAME 目标仍是 `<id>.cfargotunnel.com`
   systemd unit 里注入任意指令。
 - **二进制来源**：cloudflared 默认锁定版本下载（可用 `CFBRIDGE_CLOUDFLARED_SHA256` 强制校验和）。
   Cloudflare 不发布逐资产校验和文件，所以默认只做「体积 + ELF 魔数 + 实际能跑出版本号」三重本地校验。
+- **源站 TLS 不静默降级**：`https://` 源站在 `originServerName` 为空时，cloudflared 拿 service URL
+  的主机名去校验证书——于是 `https://127.0.0.1:8443` 要求证书字面叫 `127.0.0.1`，自签必然失败，
+  症状是「隧道健康但每条请求 502」。本工具因此要求 https 源站必须有明确的 TLS 决定：
+  loopback 自动 `noTLSVerify`（这一跳不出本机），非 loopback 必须给出 `originServerName` 或显式
+  选择跳过校验；私有 CA 走 `caPool`，校验照常打开。裸 TCP 源站（`tcp://`/`ssh://`/`rdp://`）需要
+  客户端跑 `cloudflared access`，注册时必须显式确认——它和 `--allow-public` 是同一类「必须说出口」的选择。
+- **`originRequest` 白名单**：只接受已知键，拼错的键会被拒绝而不是静默变成一条不生效的规则。
 
 ## 测试
 
@@ -108,8 +148,11 @@ python3 -m unittest discover -s tests -v
 ```
 
 覆盖桥的 CONNECT 解析与前缀字节、拼接的双向大流量/半关闭/空闲超时/对端突关、
-边缘竞速的胜者与败者回收、DNS 归属保护、ingress origin、API 重试退避、
-注册表校验（zone 边界、换行注入、public 确认）、模板渲染与 unit 命名唯一性。
+边缘竞速的胜者与败者回收、DNS 归属保护、ingress origin 与 originRequest、API 分页遍历、
+重试策略（幂等可重试 / POST 只在 429 重试）、`ensure_tunnel` 认领已建成的隧道、
+注册表校验（zone 边界、换行注入、public 与裸 TCP 确认、origin TLS 决定）、
+模板渲染与 unit 命名唯一性。日志保留另有一组（`tests/test_logs.py`），
+其中最关键的一条是「原地截断后 systemd 的 append fd 仍能继续写入」。
 另有依赖层一组（`tests/test_deps.py`）：代理 URL 解析与脱敏、代理探活与 SOCKS 拒绝、
 经代理 CONNECT 到边缘、死环境变量回退到项目里的可用代理、required/optional 归类、
 各项自愈动作、启动顺序与就绪等待。测试用本地 TCP 桩冒充沙盒代理，不联网、不碰 /etc。

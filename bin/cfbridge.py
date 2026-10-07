@@ -1814,10 +1814,13 @@ def cmd_up(args) -> None:
         save_config(proj, cfg)
         print("note: filled the default origin TLS decision for loopback https origin(s)")
     for s in cfg["services"]:
-        # allow_public=False here on purpose: the public-exposure consent
-        # is recorded once at add-service time (public_confirmed) and a
-        # hand-edited config.json must not be able to skip it.
-        validate_service(cfg, s, allow_public=False)
+        # allow_public=True here on purpose: the public-exposure consent was
+        # recorded once at add-service time (public_confirmed), and `up` must
+        # honor it (including hook-driven restores, which cannot re-confirm
+        # interactively). A hand-edited config.json that flips auth to public
+        # without public_confirmed still dies in validate_service, so the
+        # recorded-consent requirement is not skipped.
+        validate_service(cfg, s, allow_public=True)
 
     adopt_project_proxy(proj)
     mode = detect_mode(proj, cfg)

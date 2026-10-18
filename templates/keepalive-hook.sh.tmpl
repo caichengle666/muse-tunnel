@@ -1,13 +1,20 @@
 #!/usr/bin/env bash
 # cf-tunnel-keepalive hook (rendered by cfbridge install-autostart).
 # Keeps the cf-tunnel-bridge stack of ONE project alive:
+#   - run/stopped present (cfbridge down / teardown) -> do nothing
 #   - all managed units active + every service health ok -> silent
 #   - otherwise reinstall units from the project's persistent systemd/
-#     copies (container rebuilds wipe /etc) and restart the stack
-#   - still unhealthy -> wake the agent, throttled to once per 30 min
-# proxy.env is refreshed from the current environment each poll: if
-# the sandbox proxy rotates, services follow. Credentials are written
-# only into secrets/proxy.env (600), never logged.
+#     copies (container rebuilds wipe /etc), start the units that are
+#     down in dependency order and restart only the service units whose
+#     own health check fails; a healthy bridge/cloudflared is never
+#     bounced, and repairs are throttled to one per 5 minutes
+#   - still unhealthy -> doctor --fix, then wake the agent (throttled
+#     to once per 30 min)
+# proxy.env is refreshed each poll through `cfbridge sync-proxy`, which
+# probes the proxy first: only a value that answers is ever written, so
+# a stale variable in this environment cannot clobber a working entry.
+# Credentials are written only into secrets/proxy.env (600), never
+# logged. Local health probes never go through a proxy.
 set -euo pipefail
 source "$HATCH_HOOK_RUNTIME"
 
@@ -15,8 +22,13 @@ PROJ="{{PROJECT_DIR}}"
 CFG="$PROJ/config.json"
 UNITS_FILE="$PROJ/run/managed-units.txt"
 CANON_DIR="$PROJ/systemd"
+# Overridable only so the hook can be exercised in tests without /etc.
+ETC_UNITS="${CFB_SYSTEMD_UNIT_DIR:-/etc/systemd/system}"
 
 [[ -f "$CFG" ]] || { log "cf-tunnel: no config.json in project" '{}'; silent "project config missing"; }
+# `cfbridge down` means down: restarting here would put the services
+# back on the public internet behind the user's back.
+[[ -f "$PROJ/run/stopped" ]] && silent "stack intentionally stopped (cfbridge down); run cfbridge up to resume"
 [[ -f "$UNITS_FILE" ]] || silent "no managed units recorded yet (run cfbridge up first)"
 
 mapfile -t UNITS < "$UNITS_FILE"
@@ -37,31 +49,31 @@ if [[ -f "$CFB" ]] && command -v python3 >/dev/null 2>&1; then
   python3 "$CFB" --project "$PROJ" prune-logs --quiet >/dev/null 2>&1 || true
 fi
 
-# --- refresh proxy.env from env (contains proxy creds; 600 only) ---
-proxy_url="${HTTPS_PROXY:-${https_proxy:-}}"
-if [[ -n "$proxy_url" ]]; then
-  tmp_env="$PROJ/secrets/.proxy.env.tmp"
-  {
-    printf 'HTTPS_PROXY=%s\n' "$proxy_url"
-    printf 'https_proxy=%s\n' "$proxy_url"
-    [[ -n "${HTTP_PROXY:-}" ]] && printf 'HTTP_PROXY=%s\n' "$HTTP_PROXY"
-    [[ -n "${http_proxy:-}" ]] && printf 'http_proxy=%s\n' "$http_proxy"
-    [[ -n "${NO_PROXY:-}" ]] && printf 'NO_PROXY=%s\n' "$NO_PROXY"
-    [[ -n "${no_proxy:-}" ]] && printf 'no_proxy=%s\n' "$no_proxy"
-    true
-  } > "$tmp_env"
-  chmod 600 "$tmp_env"
-  if ! cmp -s "$tmp_env" "$PROJ/secrets/proxy.env" 2>/dev/null; then
-    mv -f "$tmp_env" "$PROJ/secrets/proxy.env"
+# --- refresh proxy.env (contains proxy creds; 600 only) ---
+# Delegated to the CLI: it probes the environment's proxy and the one
+# already in proxy.env (CFBRIDGE_PROXY first) and writes only a value
+# that answers. Copying this environment blindly used to overwrite the
+# one working entry with a rotated-away value, every minute.
+if [[ -f "$CFB" ]] && command -v python3 >/dev/null 2>&1; then
+  sync_out="$(python3 "$CFB" --project "$PROJ" sync-proxy --quiet 2>/dev/null || true)"
+  if [[ "$sync_out" == *refreshed* ]]; then
     log "cf-tunnel: proxy.env refreshed" '{}'
-  else
-    rm -f "$tmp_env"
   fi
 fi
 
-# --- service health list: "port<TAB>path" per service ---
-# python3 is guaranteed present (the stack runs on it); jq is only a
-# fallback, so the config parse works without either.
+# Unit-name prefix of this project ("cfb-<slug>-"), taken from the
+# cloudflared unit so service units can be matched to their services.
+PREFIX=""
+for u in "${UNITS[@]}"; do
+  if [[ "$u" == *-cloudflared ]]; then PREFIX="${u%cloudflared}"; fi
+done
+
+# --- service health list: name, port, path, managed; separated by
+# \x1f (a non-whitespace IFS character, so empty fields do not collapse)
+# managed=1 when the service has a start_cmd (cfbridge runs it, so a
+# restart can fix it); 0 for route-only services the user runs, which
+# no restart of ours can fix. python3 is guaranteed present (the stack
+# runs on it); jq is only a fallback.
 svc_list() {
   if command -v python3 >/dev/null 2>&1; then
     python3 - "$CFG" <<'PY'
@@ -75,65 +87,158 @@ for s in cfg.get("services") or []:
     port = s.get("port")
     if not port:
         continue
-    print(f"{port}\t{s.get('health') or '/health'}")
+    managed = 1 if s.get("start_cmd") else 0
+    print("\x1f".join([str(s.get("name") or ""), str(port), str(s.get("health") or "/health"), str(managed)]))
 PY
   elif command -v jq >/dev/null 2>&1; then
-    jq -r '.services[]? | "\(.port)\t\(.health // "/health")"' "$CFG" 2>/dev/null || true
+    jq -r '.services[]? | select(.port) | "\(.name // "")\u001f\(.port)\u001f\(.health // "/health")\u001f\(if (.start_cmd // "") != "" then 1 else 0 end)"' "$CFG" 2>/dev/null || true
   fi
 }
 
 mapfile -t SVCS < <(svc_list || true)
 
-healthy() {
-  local u port path line
+# Loopback probe that never goes through a proxy: curl and urllib both
+# honour http_proxy and neither exempts 127.0.0.1 by itself. Exit 2 =
+# no probe tool available (health unknown, which is not "unhealthy").
+probe_local() {
+  local url="$1"
+  if command -v curl >/dev/null 2>&1; then
+    curl --noproxy '*' --fail --silent --max-time 5 -o /dev/null "$url" 2>/dev/null
+    return $?
+  fi
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - "$url" <<'PY' 2>/dev/null
+import sys, urllib.request
+opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+try:
+    with opener.open(sys.argv[1], timeout=5) as r:
+        sys.exit(0 if 200 <= r.status < 400 else 1)
+except Exception:
+    sys.exit(1)
+PY
+    return $?
+  fi
+  return 2
+}
+
+# Fills DOWN_UNITS (managed units not active), BAD_SVC_UNITS (active
+# service units whose own health check fails) and BAD_ROUTE (failing
+# route-only services). Returns 0 only when all three are empty.
+DOWN_UNITS=(); BAD_SVC_UNITS=(); BAD_ROUTE=()
+assess() {
+  local u line name port path managed rc unit
+  DOWN_UNITS=(); BAD_SVC_UNITS=(); BAD_ROUTE=()
   for u in "${UNITS[@]}"; do
-    systemctl is-active --quiet "$u" 2>/dev/null || return 1
+    systemctl is-active --quiet "$u" 2>/dev/null || DOWN_UNITS+=("$u")
   done
   # Every service must answer, not just the first one: otherwise a dead
   # second service stays dead while the hook keeps reporting healthy.
   for line in "${SVCS[@]}"; do
     [[ -n "$line" ]] || continue
-    port="${line%%$'\t'*}"
-    path="${line#*$'\t'}"
+    IFS=$'\x1f' read -r name port path managed <<<"$line"
     [[ -n "$port" ]] || continue
-    curl --fail --silent --max-time 5 "http://127.0.0.1:${port}${path}" >/dev/null 2>&1 || return 1
+    rc=0
+    probe_local "http://127.0.0.1:${port}${path}" || rc=$?
+    [[ "$rc" == "0" || "$rc" == "2" ]] && continue
+    unit="${PREFIX}svc-${name}"
+    if [[ "$managed" == "1" && -n "$PREFIX" ]] && printf '%s\n' "${UNITS[@]}" | grep -qxF -- "$unit"; then
+      # A unit that is down is already on DOWN_UNITS; only an active
+      # but unhealthy one needs an explicit restart.
+      printf '%s\n' "${DOWN_UNITS[@]}" | grep -qxF -- "$unit" || BAD_SVC_UNITS+=("$unit")
+    else
+      BAD_ROUTE+=("${name:-port $port}")
+    fi
   done
-  return 0
+  [[ ${#DOWN_UNITS[@]} -eq 0 && ${#BAD_SVC_UNITS[@]} -eq 0 && ${#BAD_ROUTE[@]} -eq 0 ]]
 }
 
-if healthy; then
+healthy() { assess; }
+
+if assess; then
   silent "cf tunnel stack healthy (${#UNITS[@]} units, ${#SVCS[@]} services)"
 fi
 
-log "cf-tunnel: stack unhealthy, reinstalling units and restarting" '{}'
-missing_canon=0
-for u in "${UNITS[@]}"; do
-  if [[ -f "$CANON_DIR/$u.service" ]]; then
-    cp -f "$CANON_DIR/$u.service" "/etc/systemd/system/$u.service"
-    chmod 644 "/etc/systemd/system/$u.service" 2>/dev/null || true
-  else
-    missing_canon=1
+# Route-only services are the user's processes: nothing we restart can
+# fix them, so they alone never trigger a repair (only the wake below).
+if [[ ${#DOWN_UNITS[@]} -eq 0 && ${#BAD_SVC_UNITS[@]} -eq 0 ]]; then
+  repair_needed=0
+else
+  repair_needed=1
+fi
+
+# Repair throttle: a stack that cannot come up must not be hammered
+# with restarts every minute (each one drops live connections).
+RESTART_STAMP="$PROJ/run/hook-last-repair"
+throttled_repair=0
+if [[ "$repair_needed" == "1" && -f "$RESTART_STAMP" ]]; then
+  now_s="$(date +%s)"
+  last_repair="$(cat "$RESTART_STAMP" 2>/dev/null || echo 0)"
+  if [[ "$last_repair" =~ ^[0-9]+$ ]] && (( now_s - last_repair < 300 )); then
+    throttled_repair=1
   fi
-  systemctl enable --quiet "$u" 2>/dev/null || true
-done
-systemctl daemon-reload
-systemctl reset-failed "${UNITS[@]}" 2>/dev/null || true
-systemctl restart "${UNITS[@]}" || true
+fi
+
+missing_canon=0
+if [[ "$repair_needed" == "1" && "$throttled_repair" == "0" ]]; then
+  date +%s > "$RESTART_STAMP" 2>/dev/null || true
+  log "cf-tunnel: stack unhealthy, reinstalling units and starting what is down" '{}'
+  for u in "${UNITS[@]}"; do
+    if [[ -f "$CANON_DIR/$u.service" ]]; then
+      if ! cmp -s "$CANON_DIR/$u.service" "$ETC_UNITS/$u.service" 2>/dev/null; then
+        cp -f "$CANON_DIR/$u.service" "$ETC_UNITS/$u.service"
+        chmod 644 "$ETC_UNITS/$u.service" 2>/dev/null || true
+      fi
+    else
+      missing_canon=1
+    fi
+    systemctl enable --quiet "$u" 2>/dev/null || true
+  done
+  systemctl daemon-reload || true
+  # Dependency order: bridge -> services -> cloudflared. Only units that
+  # are down get started; an active bridge/cloudflared is left alone.
+  ordered=()
+  for u in "${DOWN_UNITS[@]}"; do
+    if [[ "$u" == *-bridge ]]; then ordered+=("$u"); fi
+  done
+  for u in "${DOWN_UNITS[@]}"; do
+    if [[ "$u" != *-bridge && "$u" != *-cloudflared ]]; then ordered+=("$u"); fi
+  done
+  for u in "${DOWN_UNITS[@]}"; do
+    if [[ "$u" == *-cloudflared ]]; then ordered+=("$u"); fi
+  done
+  for u in "${ordered[@]}"; do
+    systemctl reset-failed "$u" 2>/dev/null || true
+    systemctl start "$u" || true
+    if [[ "$u" == *-bridge ]]; then sleep 2; fi
+  done
+  for u in "${BAD_SVC_UNITS[@]}"; do
+    systemctl restart "$u" || true
+  done
+fi
 
 recovered=0
-for _ in $(seq 1 15); do
-  sleep 3
-  if healthy; then
-    recovered=1
-    break
-  fi
-done
+if [[ "$repair_needed" == "1" && "$throttled_repair" == "0" ]]; then
+  for _ in $(seq 1 15); do
+    sleep 3
+    if healthy; then
+      recovered=1
+      break
+    fi
+  done
+fi
 if [[ "$recovered" == "1" ]]; then
   log "cf-tunnel: stack recovered after reinstall" '{}'
   silent "cf tunnel stack was unhealthy and has been reinstalled/restarted; healthy now"
 fi
+if [[ "$throttled_repair" == "1" ]]; then
+  silent "cf tunnel stack unhealthy; last repair < 5 min ago (restart throttled)"
+fi
 
-log "cf-tunnel: stack still unhealthy after reinstall attempt" '{}'
+if [[ "$repair_needed" == "1" ]]; then
+  log "cf-tunnel: stack still unhealthy after reinstall attempt" '{}'
+else
+  log "cf-tunnel: route-only service(s) unhealthy; their processes are not managed here" '{}'
+fi
 if [[ "$missing_canon" == "1" ]]; then
   log "cf-tunnel: canonical units missing under $CANON_DIR" '{}'
 fi
@@ -143,7 +248,7 @@ fi
 # venv, a missing cloudflared copy, a rotated proxy.env value or a
 # bridge port taken by another project all leave units installed and
 # crash-looping. doctor --fix covers those and starts what is down.
-if [[ -f "$CFB" ]]; then
+if [[ "$repair_needed" == "1" && -f "$CFB" ]]; then
   fix_log="$PROJ/logs/last-doctor-fix.log"
   if python3 "$CFB" --project "$PROJ" doctor --fix >"$fix_log" 2>&1; then
     :  # exit 0 = every required dependency is satisfied

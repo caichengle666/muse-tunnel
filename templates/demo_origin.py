@@ -2,7 +2,8 @@
 """Demo origin for cf-tunnel-bridge smoke tests.
 
 HTTP  GET /health  -> public, "ok <timestamp>"
-WS    /ws          -> shared-key auth (header X-Bridge-Key or ?key=),
+WS    /ws          -> shared-key auth (header X-Bridge-Key only: a key
+                      in the query string lands in access logs),
                       server greeting on connect, echo per message,
                       "push-after:N" schedules a server push N seconds
                       later on the same socket.
@@ -18,6 +19,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import datetime
+import hmac
 import urllib.parse
 
 import websockets
@@ -32,10 +34,13 @@ def now() -> str:
 
 
 def key_ok(request) -> bool:
-    if request.headers.get("X-Bridge-Key") == KEY:
-        return True
-    qs = urllib.parse.parse_qs(urllib.parse.urlparse(request.path).query)
-    return qs.get("key", [""])[0] == KEY
+    """Header only, compared in constant time.
+
+    `?key=` used to be accepted too, which contradicted the rule that
+    the key never goes into a URL (Cloudflare and origin access logs).
+    """
+    got = request.headers.get("X-Bridge-Key") or ""
+    return bool(KEY) and hmac.compare_digest(got.encode(), KEY.encode())
 
 
 async def process_request(connection, request):

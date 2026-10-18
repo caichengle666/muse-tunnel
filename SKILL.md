@@ -16,23 +16,28 @@ description: "在 Muse 式沙盒（出网只有共享代理、系统 DNS 给假 
 ```bash
 CFB="python3 ~/workspace/skills/cf-tunnel-bridge/bin/cfbridge.py"
 $CFB --project ~/workspace/projects/<proj> doctor [--fix]   # 依赖体检 + 模式判定（--json 可机读，--fix 顺手修）
-$CFB --project ~/workspace/projects/<proj> init --zone example.com --tunnel-name <name>
+$CFB --project ~/workspace/projects/<proj> init --zone example.com --tunnel-name <name> [--bridge-port N] [--no-venv]
 $CFB --project ~/workspace/projects/<proj> add-service --name files --hostname files.example.com --port 8080 \
-     [--origin-url https://127.0.0.1:8443 --origin-tls-name <cert name>] \
+     [--health /health] \
+     [--origin-url https://127.0.0.1:8443 --origin-tls-name <cert name> | --origin-no-verify] \
      [--origin-request '{"caPool": "..."}'] [--allow-tcp-origin] \
-     [--start-cmd "..."] [--auth key|public --allow-public]
+     [--start-cmd "..." --workdir <dir> --env-proxy] [--auth key|public --allow-public]
 $CFB --project ~/workspace/projects/<proj> demo --hostname demo.example.com   # 自带密钥鉴权的 WS 演示服务
 $CFB --project ~/workspace/projects/<proj> up [--force-dns]  # 自愈依赖 → 日志保留 → 建隧道+DNS → 装 systemd → 按依赖顺序拉起并验活
 $CFB --project ~/workspace/projects/<proj> status [--json]   # 单元状态 + 本地/公网 health
 $CFB --project ~/workspace/projects/<proj> verify [--ws]     # 公网端到端验证（含“无密钥必须被拒”）
-$CFB --project ~/workspace/projects/<proj> prune-logs [--retention-hours N|--force]  # 日志保留策略（默认 1 天）
+$CFB --project ~/workspace/projects/<proj> prune-logs [--retention-hours N|--force] [--quiet] [--json]  # 日志保留策略（默认 1 天）
 $CFB --project ~/workspace/projects/<proj> install-autostart # 渲染保活 hook 脚本并打印注册步骤
 $CFB --project ~/workspace/projects/<proj> down             # 停服务并写 run/stopped（hook 不再拉起；隧道/DNS 保留）
 $CFB --project ~/workspace/projects/<proj> teardown [--purge-project]  # 删单元清单与副本、隧道+DNS（+可选删项目）
-$CFB --project ~/workspace/projects/<proj> sync-proxy       # 探活后把可用代理写进 secrets/proxy.env（hook 每轮调用）
+$CFB --project ~/workspace/projects/<proj> sync-proxy [--timeout 5] [--quiet]  # 探活后把可用代理写进 secrets/proxy.env（hook 每轮调用）
 ```
 
-`up` / `down` / `teardown` 需要 root（要写 `/etc/systemd/system`）；`doctor` / `status` / `verify` / `prune-logs` 不需要。
+未传 `--project` 时用 `$CFBRIDGE_PROJECT`，再没有就用当前目录。`up` / `down` 需要 root（要写 `/etc/systemd/system`）；`teardown` 在装过单元（有 `run/managed-units.txt`）时需要 root；`doctor` / `status` / `verify` / `prune-logs` / `sync-proxy` 不需要。
+
+- `down`：先写 `run/stopped` 再停 unit。之后保活 hook 一开头就跳过、`doctor --fix` 输出 `SKIPPED` 不拉起、也不为停用的栈重渲染 unit；`status` 会显示停用状态；隧道和 DNS 保留。下一次 `up` 清掉标记并恢复。
+- `teardown`：同样先写 `run/stopped`，停用并删除 `/etc/systemd/system` 里的单元，再删 `run/managed-units.txt` 和 `systemd/` 里列出的单元副本；然后删隧道和**真正指向本隧道**的 DNS 记录（他人记录不动），最后打印 `hooks.remove cfb-<项目>-keepalive` 提示。`--purge-project` 只删 `$HOME` 下、带 `config.json` 的项目目录，否则拒绝。
+- `sync-proxy`：先探活，只把能连上的代理写进 `secrets/proxy.env`（保留文件里原有的 `NO_PROXY` 等行）；找得到代理但探活不通时文件保持不动、退出码 1（压根没配代理时静默退出）。保活 hook 每轮调它，不再自己照抄环境变量写文件。
 
 项目目录结构、服务注册表字段和鉴权语义见 `references/services-schema.md`；故障对照见 `references/troubleshooting.md`。
 
@@ -111,8 +116,8 @@ $CFB --project ~/workspace/projects/<proj> sync-proxy       # 探活后把可用
 ## Workflow（条件 → 动作）
 
 1. **先诊断**：跑 `doctor`。输出 `mode=bridge` → 桥必需（本沙盒常态）；`mode=direct` → 跳过桥。doctor 里 `cf` 一项报错 → 先解决凭据，不继续。底部 `dependencies:` 里任何 `MISSING` 都要处理：`doctor --fix` 能修的直接修，修不了的当面告诉用户缺什么。退出码 1 就代表还有 required 依赖没满足，别把它当成正常输出略过。
-2. **建项目**：`init --zone <用户域名>`。项目必须在 `~/workspace/` 下（只有家目录持久）；用户给了别的路径先提醒再确认。路径只能含 `[A-Za-z0-9._/+,:=@~-]`，因为它会原样进 root 执行的 hook 和 systemd 单元，带空格、引号、`$`、`%` 的路径会被拒绝。
-3. **注册服务**：每要挂一个服务就 `add-service` 一条；只需要验链路就先 `demo` 注册演示服务。服务有自己的启动命令才加 `--start-cmd`；已经在端口上跑着的服务只注册路由、不接管进程。源站不是 `http://127.0.0.1:<port>` 时按上面「origin 与 TLS」那节选参数——`https://` 源站必须交代证书怎么验，`tcp://` 之类必须显式确认，否则注册会被拒绝。
+2. **建项目**：`init --zone <用户域名>`。项目必须在 `~/workspace/` 下（只有家目录持久）；用户给了别的路径先提醒再确认。路径只能含 `[A-Za-z0-9._/+,:=@~-]`，因为它会原样进 root 执行的 hook 和 systemd 单元，带空格、引号、`$`、`%` 的路径会被拒绝（`init` 校验项目路径；渲染单元和 `install-autostart` 还会校验 skill 自身所在路径）。
+3. **注册服务**：每要挂一个服务就 `add-service` 一条；只需要验链路就先 `demo` 注册演示服务。服务有自己的启动命令才加 `--start-cmd`；已经在端口上跑着的服务只注册路由、不接管进程。`start_cmd` 会原样写进 systemd 的 `ExecStart=`，所以：每个词开头单独的 `~` 会展开成家目录（`add-service` 存展开后的值，渲染时也会对旧配置再展开一次）；带 `/` 的可执行文件必须是绝对路径（允许 systemd 的 `-@:+!` 前缀），相对路径直接拒绝；`%` 自动转义成 `%%`（`workdir` 同样展开 `~`、转义 `%`）；`$VAR` 由 systemd 展开，要字面 `$` 自己写 `$$`（工具只提示不转义）；不能含换行。服务要经沙盒代理出网时加 `--env-proxy`（注入 `secrets/proxy.env`）。源站不是 `http://127.0.0.1:<port>` 时按上面「origin 与 TLS」那节选参数——`https://` 源站必须交代证书怎么验，`tcp://` 之类必须显式确认，否则注册会被拒绝。
 4. **拉起**：`up`。它依次做：校验注册表 → **自愈依赖（缺什么补什么，输出 `fixed:` 行）** → 体检并拦下仍缺失的必需依赖 → **执行日志保留策略（输出 `logs:` 行）** → 建/复用命名隧道并写 ingress → 建 DNS（遇他人记录会停下）→ 渲染并安装 systemd 单元 → 按桥→服务→cloudflared 顺序启动、每层等就绪 → 本地验活。任一步失败看输出停在哪一层，对照 troubleshooting，不要换花样重试。
 5. **验公网**：`verify --ws`（带 WS 的服务）。分层报告：本地 health、公网 health、WS 三档（无密钥应被关、正确密钥 greeting/echo 通）。哪层没过就说哪层，不许含糊报“通了”。
 6. **装保活**：`install-autostart` 渲染 hook 脚本后，按它打印的步骤用 hooks 工具 `add → dry_run → enable`。dry_run 期望 silent/healthy；不 healthy 先修服务再 enable。

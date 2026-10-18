@@ -92,7 +92,10 @@ proxy (沙盒共享代理, secrets/proxy.env 是 unit 唯一的来源)
 - 只有家目录 `/home/hatch` 是持久卷；系统目录（/etc、/usr）随容器重建丢失。所以一切源头放项目目录：config、secrets、systemd 规范副本、cloudflared 二进制副本、venv、hook 脚本。
 - 第一层：systemd `Restart=always`，单进程崩了自己拉。
 - 第二层：单元规范副本在项目 `systemd/`，`/etc` 里的只是安装件。
-- 第三层：Muse hook（`install-autostart` 渲染）每 60 秒巡检；发现单元缺失/不健康就从规范副本重装并整套重启；沙盒重建后 hook 定义还在，第一轮巡检（约 1 分钟内）即恢复。hook 自己修不动时（venv 丢、cloudflared 副本坏、代理轮换、桥端口被占）会再调一次 `doctor --fix`，把依赖层也补齐；仍不行才节流 wake agent（30 分钟一次）。
+- 第三层：Muse hook（`install-autostart` 渲染）每 60 秒巡检。发现单元缺失或不健康时，先从规范副本补装 /etc 里缺的 unit，再按「桥 → 服务 → cloudflared」的顺序启动没在跑的 unit，只重启自己 health 不过的托管服务 unit；健康的桥和 cloudflared 不碰（重启它们会断掉所有隧道连接）。修复最多 5 分钟一次（`run/hook-last-repair`）。沙盒重建后 hook 定义还在，第一轮巡检（约 1 分钟内）即恢复。hook 自己修不动时（venv 丢、cloudflared 副本坏、代理轮换、桥端口被占）会再调一次 `doctor --fix`，把依赖层也补齐；仍不行才节流 wake agent（30 分钟一次）。只做路由的服务（进程归用户）挂了不会触发重启，只 wake。
+- 停用状态：`cfbridge down` 写 `run/stopped`，hook 和 `heal_stack()` 见到它就什么都不启动，`up` 才清除。没有这个标记，hook 会在一分钟内把刚停掉的服务重新暴露到公网。`teardown` 还会删 `run/managed-units.txt` 与 `systemd/` 副本，hook 就没有可重装的东西了。
+- 本地探测不走代理：hook 用 `curl --noproxy '*'`（没有 curl 时用 python 的空 `ProxyHandler`），CLI 用 `local_get()`。这类沙盒普遍设了 `http_proxy`，而 curl 和 urllib 都不会自动绕开 127.0.0.1。
+- 代理文件只写验证过的值：hook 每轮调用 `cfbridge sync-proxy`，它先探活（环境 → `secrets/proxy.env`），只把能连上的那条写回文件。
 
 ## 与官方命名的关系
 
@@ -138,15 +141,14 @@ Tunnel 前身是 Argo Tunnel，所以 CNAME 目标仍是 `<id>.cfargotunnel.com`
 - **隧道令牌**经 `--token-file` 传给 cloudflared，不出现在进程参数里（`ps` 看不到），落盘 600。
 - **共享密钥**只走 `X-Bridge-Key` 请求头；不要放进 URL query（query 会进 Cloudflare 与源站访问日志）。
   `verify` 按此实现，并且会额外验一次「不带密钥必须被拒」。
-- **DNS 归属**：本工具建的记录带 `cf-tunnel-bridge managed` 注释。`up` 只改写自己建的、
-  或已指向本隧道的记录，遇到他人的记录直接报错停下；`teardown` 同理只删自己的那份。
-  这是为了不让一条隧道的生命周期误伤同 zone 下别人正在用的域名。
+- **DNS 归属**：本工具建的记录带 `cf-tunnel-bridge managed tunnel=<隧道 ID>` 注释。旧版本用的是所有项目共用的注释，同一个 zone 里的项目 A 因此会改写、甚至删掉项目 B 的记录。现在 `up` 只改写三种记录：指向本隧道的、指向本项目之前用过的隧道的、带本隧道注释的；遇到他人的记录直接报错停下。`teardown` 只删真正指向本隧道的记录。这是为了不让一条隧道的生命周期误伤同 zone 下别人正在用的域名。
+- **项目路径白名单**：项目路径和 skill 路径会原样进 hook（bash 双引号里，root 每分钟执行）和 systemd 单元（空格会拆参数，`%` 是 specifier），所以渲染前只允许 `[A-Za-z0-9._/+,:=@~-]`，其余一律拒绝，不分别转义。
 - **落地文件的权限**：所有密钥用 `os.open(..., 0o600)` 在创建时就定权，不存在
   「先按默认 umask 建、再 chmod」的空窗；写入走临时文件 + `rename`，崩溃不会留下半截密钥。
 - **模板渲染**：占位符未解析就报错停下；代入值含换行也直接拒绝——否则一个配置字段就能往
   systemd unit 里注入任意指令。
 - **二进制来源**：cloudflared 默认锁定版本下载（可用 `CFBRIDGE_CLOUDFLARED_SHA256` 强制校验和）。
-  Cloudflare 不发布逐资产校验和文件，所以默认只做「体积 + ELF 魔数 + 实际能跑出版本号」三重本地校验。
+  Cloudflare 不发布逐资产校验和文件。所以设了 SHA 就只比对哈希；没设时在落盘前检查体积和 ELF 魔数。两种情况落盘后都会实际运行一次 `--version`，跑不起来就报错；项目里已有的副本跑不起来时，会被改名为 `.broken` 再重装。
 - **源站 TLS 不静默降级**：`https://` 源站在 `originServerName` 为空时，cloudflared 拿 service URL
   的主机名去校验证书——于是 `https://127.0.0.1:8443` 要求证书字面叫 `127.0.0.1`，自签必然失败，
   症状是「隧道健康但每条请求 502」。本工具因此要求 https 源站必须有明确的 TLS 决定：

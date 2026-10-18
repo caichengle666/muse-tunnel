@@ -83,17 +83,38 @@ def doh_query(name: str, qtype: str) -> list[dict]:
 
 
 def fetch_edge_ips() -> list[str]:
-    """Real edge IPs via DoH; SRV gives the port, A gives addresses."""
-    ips: list[str] = []
+    """Real edge IPs via DoH; SRV gives the port, A gives addresses.
+
+    The regions are interleaved (r1, r2, r1, r2, ...) rather than
+    concatenated: a race only takes the first few candidates, and with
+    region1 listed first region2 was never tried at all.
+    """
+    per_region: list[list[str]] = []
     for name in EDGE_SRV_NAMES:
+        found: list[str] = []
         try:
             for ans in doh_query(name, "A"):
                 ip = str(ans.get("data", ""))
-                if ip.count(".") == 3 and ip not in ips:
-                    ips.append(ip)
+                if ip.count(".") == 3 and ip not in found:
+                    found.append(ip)
         except Exception as e:  # noqa: BLE001 - fall through to fallback list
             log(f"DoH lookup failed for {name}: {e}")
+        per_region.append(found)
+    ips: list[str] = []
+    for i in range(max((len(r) for r in per_region), default=0)):
+        for region in per_region:
+            if i < len(region) and region[i] not in ips:
+                ips.append(region[i])
     return ips or list(FALLBACK_EDGES)
+
+
+def rotate(ips: list[str], offset: int) -> list[str]:
+    """`ips` starting at `offset` (wrapping), so successive race rounds
+    reach candidates beyond the first race-width slice."""
+    if not ips:
+        return []
+    k = offset % len(ips)
+    return ips[k:] + ips[:k]
 
 
 def proxy_target() -> tuple[str, int, str | None]:
@@ -334,6 +355,7 @@ class EdgeBridge:
         self.proxy = proxy_target()
         self._lock = threading.Lock()
         self.edge_ips = fetch_edge_ips()
+        self._offset = 0
         self._last_doh = time.monotonic()
         log(f"edge candidates: {len(self.edge_ips)}")
 
@@ -345,13 +367,24 @@ class EdgeBridge:
         ips = fetch_edge_ips()
         if ips and ips != self.edge_ips:
             self.edge_ips = ips
+            self._offset = 0
             log(f"edge candidates refreshed via DoH: {len(ips)}")
 
     def race_edges(self) -> tuple[str, socket.socket, bytes] | None:
-        """Race several edge IPs; first CONNECT 200 wins."""
-        return race_connect(self.edge_ips, self.proxy, race=self.race,
-                            connect_timeout=self.connect_timeout,
-                            race_timeout=self.race_timeout)
+        """Race several edge IPs; first CONNECT 200 wins.
+
+        A round that fails everywhere moves the window on by one race
+        width, so the next round (and the next client) tries different
+        candidates even when a DoH refresh hands back the same list.
+        A winning window is kept: it is the best guess for the next one.
+        """
+        offset = getattr(self, "_offset", 0)
+        raced = race_connect(rotate(self.edge_ips, offset), self.proxy, race=self.race,
+                             connect_timeout=self.connect_timeout,
+                             race_timeout=self.race_timeout)
+        if raced is None and len(self.edge_ips) > self.race:
+            self._offset = (offset + self.race) % len(self.edge_ips)
+        return raced
 
     def handle(self, client: socket.socket) -> None:
         try:

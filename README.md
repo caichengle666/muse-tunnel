@@ -97,13 +97,18 @@ python3 -m unittest discover -s tests -v
 
 - **项目目录即部署单元**：配置、密钥（600）、systemd 规范副本、cloudflared 二进制副本全放在家目录的项目文件夹里——这类沙盒只有家目录持久。
 - **服务注册表**（项目 `config.json`）：子域名 → 本地端口（或自定义 origin）→ 鉴权（`key` 默认 / `public` 需显式确认并记录）→ 可选启动命令。`up` 一次把隧道 ingress、DNS、常驻单元全部收敛。
+- **`auth=key` 是源站的事**：cfbridge 不在路上拦请求，`key` 只表示「源站自己校验 `X-Bridge-Key`」。源站没实现校验，服务就对全网开放；`verify` 不带 `--ws` 只验公网 health，会明确打出 `auth NOT verified`。要边缘侧鉴权请用 Cloudflare Access。
+- **`start_cmd` 按 systemd 规则落地**：开头的 `~` 会被展开成家目录（systemd 自己不展开）；带 `/` 的可执行文件必须是绝对路径；`%` 会被转义成字面量（如 `date +%s`）；`$VAR` 仍由 systemd 展开，字面 `$` 写 `$$`。
+- **项目路径白名单**：项目路径会原样进 root 每分钟执行的 hook 脚本和 systemd 单元，所以只允许 `[A-Za-z0-9._/+,:=@~-]`；带引号、`$`、反引号、空格、`%` 的路径会被拒绝。
 - **依赖自己体检、自己补**：`doctor` 是真的去用一遍依赖（代理连通性、经代理 CONNECT 到边缘 7844、cloudflared 能不能跑、桥端口能不能绑、服务 venv 在不在），不是看看环境变量在不在；`doctor --fix` 与 `up` 会把工具该负责的那些缺项直接补上（含代理被轮换后从 `secrets/proxy.env` 取回可用值），只有真修不了的（无 root / 无 systemd / 代理挂了）才报出来。
-- **按依赖顺序拉起并等就绪**：桥 → 服务 → cloudflared 逐层启动，桥没监听就不去拉 cloudflared；cloudflared 只算「起来」当日志里出现 `Registered tunnel connection`，否则视为未注册并重启。
-- **自动拉起三层**：systemd `Restart=always` 兜进程崩溃；规范副本兜 /etc 被清；保活 hook 兜沙盒重建，约一分钟自动恢复（hook 自己修不动时会调用 `doctor --fix` 兜底）。
+- **按依赖顺序拉起并等就绪**：桥 → 服务 → cloudflared 逐层启动，桥没监听就不去拉 cloudflared；cloudflared 只算「起来」当日志里**最后一次** `Starting tunnel` 之后出现过 `Registered tunnel connection`。重启之后一直没注册才判为未注册并重启；日志被滚动、两种标记都找不到时不动它（不会误重启一条跑了很久的健康隧道）。
+- **自动拉起三层**：systemd `Restart=always` 兜进程崩溃；规范副本兜 /etc 被清；保活 hook 兜沙盒重建，约一分钟自动恢复（hook 自己修不动时会调用 `doctor --fix` 兜底）。hook 只启动没在跑的 unit、只重启自己 health 不过的服务 unit，健康的桥和 cloudflared 不碰；修复最多 5 分钟一次。只做路由的服务（没有 `start_cmd`）挂了不会触发重启，只会节流 wake agent。
+- **本地探测不走代理**：本地 health（`up`/`status`/hook）一律绕过 `HTTP_PROXY`/`http_proxy`（urllib 用空 `ProxyHandler`、curl 用 `--noproxy '*'`）。这两者默认都不会自动绕开 127.0.0.1。
+- **`down` 就是停**：`down` 会写 `run/stopped` 标记，hook 和 `doctor --fix` 看到它就不再拉起；下一次 `up` 才清掉它。`teardown` 还会删掉 `run/managed-units.txt` 和 `systemd/` 里的单元副本，并提示把保活 hook 也移除（`hooks.remove cfb-<slug>-keepalive`）。
 - **凭据卫生**：令牌只从 connector 或环境变量读，永不写进代码与仓库；写进项目的密钥文件一律 600 且被 .gitignore 排除；代理 URL 打印前一律脱敏成 `http://***@host:port`。
-- **不动别人的 DNS**：本工具建的记录带 `cf-tunnel-bridge managed` 注释，`up`/`teardown` 只碰自己建的或已指向本隧道的记录；目标子域名上有他人记录时直接报错停下，需显式 `--force-dns` 才覆盖。
+- **不动别人的 DNS**：本工具建的记录带 `cf-tunnel-bridge managed tunnel=<隧道 ID>` 注释（带上隧道 ID，同一个 zone 里的两个项目才分得清）。`up` 只改写指向本隧道（或本项目之前用过的隧道）的记录，或带本隧道注释的记录；`teardown` 只删真正指向本隧道的记录。只带旧版共享注释、却指向别的隧道的记录一律当作他人的。目标子域名上有他人记录时直接报错停下，需显式 `--force-dns` 才覆盖（会先删掉同名的 A/AAAA 再建 CNAME）。
 - **日志有上限，默认留 1 天**：三个 unit 的 stdout 都 `append:` 进项目 `logs/`，而那是唯一持久卷——用户程序一啰嗦就能把 `config.json` 和 `secrets/` 一起写坏。`up` 和保活 hook 每轮都跑保留策略：到窗口就滚动、单文件超上限就截尾、被移除服务的日志按 mtime 清掉。滚动是**原地截断**（systemd 握着 fd 往原 inode 追加，rename 会把活动日志变成看不见的孤儿文件）。窗口改 `config.json` 的 `log_retention_hours`，或 `cfbridge prune-logs --retention-hours N`（0 = 不清理）。
-- **可复现的二进制**：cloudflared 默认锁版本下载（而非 `latest`），可用 `CFBRIDGE_CLOUDFLARED_SHA256` 强制校验和；落盘前做体积 + ELF + 实际运行三重校验。
+- **可复现的二进制**：cloudflared 默认锁版本下载（而非 `latest`），可用 `CFBRIDGE_CLOUDFLARED_SHA256` 强制校验和。设了 SHA 就只比对哈希；没设则在落盘前检查体积和 ELF 魔数。落盘后再实际运行一次 `--version`，跑不起来就报错。项目里已有的副本跑不起来时，`doctor --fix`/`up` 会把它改名为 `cloudflared.broken`，然后重新安装。
 - **列表接口分页遍历**：账号 / 隧道 / DNS 记录都按 `result_info.total_pages` 翻页——列表被截断不只是「少看见几条」，它会让 `ensure_tunnel` 以为隧道不存在又建一条同名的。
 - **不盲目重试非幂等请求**：POST 只在 429（确定没执行）时重试；5xx 与传输超时对 POST 是「可能已经生效」，直接抛出，由 `ensure_tunnel` 回读列表去认领，而不是再造一条。
 
@@ -112,7 +117,7 @@ python3 -m unittest discover -s tests -v
 | 变量 | 作用 |
 |---|---|
 | `CFBRIDGE_PROJECT` | 未传 `--project` 时的项目目录 |
-| `CFBRIDGE_PROXY` | 显式钉住出网代理（优先于 `HTTPS_PROXY`），`up`/`doctor --fix` 会把它写进 `secrets/proxy.env` |
+| `CFBRIDGE_PROXY` | 显式钉住出网代理（优先于 `HTTPS_PROXY`）。`up`、`doctor --fix` 和 hook（经 `sync-proxy`）只把**探活通过**的代理写进 `secrets/proxy.env`，所以死值不会覆盖还能用的那条 |
 | `CFBRIDGE_CLOUDFLARED_VERSION` | 覆盖内置固定版本（默认 `2026.9.3`；`latest` 则跟最新） |
 | `CFBRIDGE_CLOUDFLARED_URL` / `_SHA256` / `_ASSET` | 指定下载地址 / 强制校验和 / 指定架构资产 |
 | `CF_API_TOKEN` | 未接 connector 时的凭据来源 |
@@ -121,7 +126,7 @@ python3 -m unittest discover -s tests -v
 
 ```
 SKILL.md            给 agent 的执行清单（条件 → 动作）
-bin/cfbridge.py     确定性 CLI：doctor(--fix)/init/add-service/demo/up/status/verify/prune-logs/down/install-autostart/teardown
+bin/cfbridge.py     确定性 CLI：doctor(--fix)/init/add-service/demo/up/status/verify/prune-logs/sync-proxy/down/install-autostart/teardown
                     含依赖体检与自愈层（代理探活、venv/cloudflared/端口/单元修复）与日志保留策略
 bin/edge_bridge.py  边缘桥（DoH 发现 + CONNECT 竞速 + 裸 TCP 拼接）
 bin/cf_api.py       Cloudflare API 最小客户端（凭据解析、DNS 归属校验、重试）

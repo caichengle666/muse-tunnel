@@ -1,6 +1,6 @@
 # CHANGELOG
 
-## 未发布 — 按 1bfa0f3 审查报告修复（H1–H2、M1–M8、L1–L8）
+## 0.6.0（2026-10-19）— 按 1bfa0f3 审查报告修复（H1–H2、M1–M8、L1–L8）
 
 ### 高
 - **H1 本地探测不走代理**：`http_get(..., direct=True)` 用空 `ProxyHandler` 的 opener，新增 `local_get()`。
@@ -55,7 +55,7 @@
 死代理下的 health、只重启坏掉的那个服务、修复节流、只做路由的服务失败、proxy.env 不被死值覆盖等场景。现有测试按新语义调整了
 4 处（DNS 注释、`heal_stack` 需要 root 和 systemd）。全部共 **237 项**通过。
 
-## 未发布 — 依赖探针不再误报（沿用桥的并行竞速）
+## 0.5.0 — 依赖探针不再误报（沿用桥的并行竞速）
 
 用户实测报上来的：第一次 `doctor` 把 `edge via proxy` 判成 **MISSING**，还提示「检查代理对 7844 的
 CONNECT 策略」；第二次加 `--fix` 重跑、**环境一点没变**，这一项直接 ok；用桥自己的
@@ -98,7 +98,7 @@ CONNECT 策略」；第二次加 `--fix` 重跑、**环境一点没变**，这�
 「MISSING 但重跑就好」「direct/bridge 来回翻」两行；SKILL.md 加了第 13 条 operating rule
 （禁止在探针里写顺序遍历候选）。
 
-## 未发布 — 日志保留、源站 TLS、API 纪律
+## 0.4.0 — 日志保留、源站 TLS、API 纪律
 
 针对「这个功能还需要完善什么」的四项（外加一项按用户要求不动）：
 
@@ -168,7 +168,7 @@ SKILL.md 增加「日志保留」与「origin 与 TLS」两节，README、refere
 
 > 按用户要求，systemd 单元的加固指令（`NoNewPrivileges` / `ProtectSystem` 等）**未改动**。
 
-## 未发布 — CI 首跑修复（Linux 上暴露的两个问题）
+## 0.3.0 — CI 首跑修复（Linux 上暴露的两个问题）
 
 上一批改动推上去后 CI 在 3.10/3.12/3.13 上全红。查下来是两个独立问题，其中一个是真回归。
 
@@ -207,7 +207,7 @@ Windows 上能——因为 Windows 回环缓冲自动调得更大，所以本机
 `* text=auto eol=lf`。这项目只在 Linux 跑，hook 脚本带 CRLF 会直接
 `/bin/bash^M: bad interpreter`，systemd 单元同理。锁定仓库内换行符，避免 Windows 端编辑引入 CRLF。
 
-## 未发布 — 依赖自己体检、自己补
+## 0.2.0 — 依赖自己体检、自己补
 
 背景：这套东西的依赖过去只被「看一眼环境变量」就算检查过了——`HTTPS_PROXY` 存在即算代理可用
 （哪怕它指向的代理一小时前就轮换掉了）、`proxy.env` 有没有没人管（它丢了桥 unit 根本起不来）、
@@ -277,7 +277,7 @@ Windows 上能——因为 Windows 回环缓冲自动调得更大，所以本机
   沙盒代理，root 与 systemctl 都是注入的假实现——**不联网、不碰 /etc、不需要 root**。
 - 全量测试 113 项通过（Python 3.13 / Windows 本机）。
 
-## 未发布 — 全面加固（代码审查后修复）
+## 0.1.0 — 全面加固（代码审查后修复）
 
 ### 修复：桥（edge_bridge）
 

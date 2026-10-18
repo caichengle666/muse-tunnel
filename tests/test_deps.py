@@ -608,12 +608,13 @@ class HealStackTests(unittest.TestCase):
                    "services": [{"name": "demo", "hostname": "d.example.com", "port": 18099,
                                  "start_cmd": "/bin/true"}]}
             with fake_root(), patched(
+                    systemctl_path=lambda: "/usr/bin/systemctl",
                     units_missing_from_etc=lambda proj_: ["cfb-x-cloudflared"],
                     render_units=lambda proj_, cfg_, mode: ["cfb-x-cloudflared"],
                     install_units=lambda proj_, units: calls.append(list(units)),
-                    start_stack=lambda proj_, cfg_, mode, restart=True: [],
+                    start_stack=lambda proj_, cfg_, mode, restart=True, **kw: [],
                     systemctl=lambda *a, **k: subprocess.CompletedProcess(list(a), 0, "inactive", ""),
-                    tunnel_registered_tail=lambda proj_: True):
+                    tunnel_registration_state=lambda proj_: "registered"):
                 lines = cfbridge.heal_stack(proj, cfg, "direct")
             self.assertEqual(calls, [["cfb-x-cloudflared"]])
             self.assertTrue(any("reinstalled" in l for l in lines), lines)
@@ -629,10 +630,12 @@ class HealStackTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as proj:
             cfg = {"zone": "example.com", "tunnel_name": "t", "services":
                    [{"name": "demo", "hostname": "d.example.com", "port": 18099}]}
-            with patched(units_missing_from_etc=lambda proj_: [],
-                         start_stack=lambda proj_, cfg_, mode, restart=True: [],
+            with fake_root(), patched(
+                         systemctl_path=lambda: "/usr/bin/systemctl",
+                         units_missing_from_etc=lambda proj_: [],
+                         start_stack=lambda proj_, cfg_, mode, restart=True, **kw: [],
                          systemctl=fake_systemctl,
-                         tunnel_registered_tail=lambda proj_: False,
+                         tunnel_registration_state=lambda proj_: "unregistered",
                          wait_tunnel_registered=lambda proj_, offset=0, timeout=45: True):
                 lines = cfbridge.heal_stack(proj, cfg, "direct")
             restarts = [a for a in seen if a[:1] == ("restart",)]

@@ -11,7 +11,9 @@
   services/              # 演示与自带小服务代码（如 demo_origin.py）
   venv/                  # 项目 venv（websockets 等）
   logs/                  # bridge.log / cloudflared.log / svc-<name>.log（默认保留 1 天）
-  run/managed-units.txt  # 当前受管 unit 名单，hook 保活按它巡检
+  run/managed-units.txt  # 当前受管 unit 名单，hook 保活按它巡检（teardown 会删掉）
+  run/stopped            # `cfbridge down` 写入：hook 与 doctor --fix 见到就不拉起；`up` 清除
+  run/hook-last-repair   # hook 上次修复的时间戳（修复节流，5 分钟一次）
   run/log-retention.json # 上次日志滚动的时间戳（窗口靠它算，不靠 mtime）
 ```
 
@@ -36,13 +38,13 @@
 | `hostname` | 对外子域名，如 `files.example.com`；必须落在 `zone` 下（按 `.` 边界判定，`notexample.com` 不算） |
 | `port` | 本地监听端口（只绑 127.0.0.1）；也是本地 health 的探测端口 |
 | `health` | 本地/公网验活路径，默认 `/health`，必须以 `/` 开头 |
-| `auth` | `key`（默认，源站自校验共享密钥）或 `public`（裸奔，需 `--allow-public`） |
-| `public_confirmed` | 由 `add-service --auth public --allow-public` 写入；`up` 会复核它，手改 config 把 auth 改成 public 而不带上它会被拒绝 |
+| `auth` | `key`（默认）或 `public`（裸奔，需 `--allow-public`）。**`key` 只是声明「源站自己校验 `X-Bridge-Key`」**，cfbridge 不在路上拦请求；源站没实现校验就等于公开 |
+| `public_confirmed` | 由 `add-service --auth public --allow-public` 写入；`up` 会复核它，手改 config 把 auth 改成 public 而不带上它会被拒绝。它是一条同意记录，不是安全边界：手改时一起写上 `true` 就能绕过 |
 | `origin` | 可选。ingress 的源站地址，默认 `http://127.0.0.1:<port>`。浏览器可开的：`http://`、`https://`、`unix:/path.sock`；**裸 TCP**（`tcp://`、`ssh://`、`rdp://`）需要客户端跑 `cloudflared access`，注册时必须 `--allow-tcp-origin` |
 | `origin_request` | 可选，透传给 cloudflared 的 `originRequest`。**`https://` 源站必须能从中看出证书怎么验**（`originServerName` 或 `noTLSVerify`），否则 `up` 直接拒绝。常见键：`originServerName`、`noTLSVerify`、`caPool`、`httpHostHeader`、`http2Origin`；未列入白名单的键会被拒绝（避免拼错后成为一条被静默忽略的规则） |
 | `tcp_origin_confirmed` | 由 `add-service --allow-tcp-origin` 写入；`up` 复核它，手改 config 加 `tcp://` 而不带它会被拒绝 |
-| `start_cmd` | 可选。有它 → cfbridge 为该服务渲染 systemd unit 并托管进程；没有 → 只做路由，服务进程用户自理 |
-| `workdir` | start_cmd 的工作目录，默认项目目录 |
+| `start_cmd` | 可选。有它 → cfbridge 为该服务渲染 systemd unit 并托管进程；没有 → 只做路由，服务进程用户自理。会写进 `ExecStart=`，所以：开头的 `~` 展开成家目录；带 `/` 的可执行文件必须是绝对路径；`%` 转义成字面量；`$VAR` 由 systemd 展开，字面 `$` 写 `$$` |
+| `workdir` | start_cmd 的工作目录，默认项目目录（`~` 会展开，`%` 会转义） |
 | `env_proxy` | true 时给服务注入 `secrets/proxy.env`（服务需要经沙盒代理出网时用） |
 
 字段值一律不得包含换行（会破坏 unit 文件），CLI 与校验都会拦。
@@ -51,14 +53,14 @@
 
 cloudflared 的 `originServerName` 为空时，用 **service URL 里的主机名**校验源站证书。`https://127.0.0.1:8443` 于是要求证书名字面是 `127.0.0.1`——自签证书必然失败，表现为隧道健康但每条请求 502。处理方式：
 
-- loopback（`127.0.0.1` / `::1` / `localhost`）：注册时自动补 `{"noTLSVerify": true}`（这一跳不出本机）。
+- loopback（`127.0.0.1` / `::1` / `localhost` / `0.0.0.0`）：注册时自动补 `{"noTLSVerify": true}`（这一跳不出本机）。
 - 非 loopback：必须 `--origin-tls-name <证书里的名字>` 或显式 `--origin-no-verify`。
 - 私有 CA：`--origin-tls-name <名字> --origin-request '{"caPool": "/etc/ssl/certs/ca.crt"}'`，校验照常打开。
 - 手改 `config.json` 时如果只写了 `https://` 而没给 TLS 决定，`up` 会报错并提示该补哪个键。
 
-`start_cmd` 里若引用项目 venv（`<project>/venv/bin/python`），那个 venv 会被当成**显式依赖**：
+`start_cmd` 里若引用项目 venv（`<project>/venv/bin/python`，`~/…` 写法也算），那个 venv 会被当成**显式依赖**：
 `doctor` 会把它列进 `dependencies:`，`up` / `doctor --fix` 发现它丢了会自动重建并装上
-`websockets>=12,<16`。需要别的包就自己装进同一个 venv（`<project>/venv/bin/pip install ...`），
+`websockets>=14,<16`（演示服务用的是 14 起才成为默认的新 asyncio API；下限是保守上调，没有离线验证过 12/13）。需要别的包就自己装进同一个 venv（`<project>/venv/bin/pip install ...`），
 别用系统 python。
 
 ## 依赖清单（`doctor` 输出）

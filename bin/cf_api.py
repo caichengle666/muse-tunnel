@@ -20,12 +20,15 @@ Retries follow the method (see api()): idempotent calls are retried on
 a lost POST response may still have been applied.
 
 DNS hygiene: records created here carry the comment
-"cf-tunnel-bridge managed". ensure_dns() only rewrites records it
-recognises as its own (by marker, or by already pointing at this
-tunnel); anything else is a hard error unless the caller explicitly
-opts into overwriting it. delete_tunnel_and_dns() applies the same
-ownership test, so tearing one bridge down cannot take another
-tunnel's DNS with it.
+"cf-tunnel-bridge managed tunnel=<tunnel id>". The marker names the
+tunnel because projects share a zone: a bare shared marker let one
+project's `up` repoint, and its `teardown` delete, another project's
+record. ensure_dns() only rewrites records that point at this tunnel
+(or a previous tunnel of the same project) or carry this tunnel's
+marker; anything else — including a record with the old, tunnel-less
+marker pointing elsewhere — is a hard error unless the caller
+explicitly opts into overwriting it. delete_tunnel_and_dns() only
+deletes records that actually point at the tunnel being deleted.
 """
 from __future__ import annotations
 
@@ -263,57 +266,92 @@ def dns_target(tunnel_id: str) -> str:
     return f"{tunnel_id}.cfargotunnel.com"
 
 
-def _is_managed(record: dict, target: str) -> bool:
+def managed_comment(tunnel_id: str) -> str:
+    return f"{MANAGED_COMMENT} tunnel={tunnel_id}"
+
+
+def _is_managed(record: dict, target: str, tunnel_id: str = "",
+                prior_tunnel_ids: tuple[str, ...] | list[str] = ()) -> bool:
     """True when this DNS record is ours to rewrite.
 
-    Either we stamped it, or it already points at this very tunnel —
-    anything else belongs to something else and must not be silently
-    repointed.
+    Ours means: it points at this tunnel, or at a tunnel this project
+    used before (recorded in its config), or it carries this tunnel's
+    own marker. The shared, tunnel-less marker of older releases does
+    NOT count on its own: every project wrote it, so it says nothing
+    about which project the record belongs to.
     """
-    if record.get("comment") == MANAGED_COMMENT:
+    content = str(record.get("content", ""))
+    if content == target:
         return True
-    return str(record.get("content", "")) == target
+    owned = [t for t in (tunnel_id, *prior_tunnel_ids) if t]
+    if any(content == dns_target(t) for t in owned):
+        return True
+    comment = record.get("comment") or ""
+    return any(comment == managed_comment(t) for t in owned)
 
 
-def ensure_dns(zone_id: str, hostname: str, tunnel_id: str, allow_overwrite: bool = False) -> str:
+# Record types Cloudflare refuses to keep next to a CNAME of the same name.
+CNAME_CONFLICT_TYPES = {"A", "AAAA", "CNAME"}
+
+
+def ensure_dns(zone_id: str, hostname: str, tunnel_id: str, allow_overwrite: bool = False,
+               prior_tunnel_ids: tuple[str, ...] | list[str] = ()) -> str:
     """Point `hostname` at this tunnel, refusing to clobber foreign records."""
     target = dns_target(tunnel_id)
+    stamp = managed_comment(tunnel_id)
     existing = _get_paged(f"/zones/{zone_id}/dns_records?name={hostname}")
     for rec in existing:
         if rec.get("type") == "CNAME" and rec.get("content") == target:
             return "unchanged"
-    foreign = [r for r in existing if not _is_managed(r, target)]
+
+    def mine(rec: dict) -> bool:
+        return _is_managed(rec, target, tunnel_id, prior_tunnel_ids)
+
+    foreign = [r for r in existing if not mine(r)]
     if foreign and not allow_overwrite:
         summary = ", ".join(f"{r.get('type')} {r.get('name')} -> {r.get('content')}" for r in foreign[:3])
+        legacy = any((r.get("comment") or "") == MANAGED_COMMENT for r in foreign)
+        hint = (" A record marked with the shared \"cf-tunnel-bridge managed\" comment may "
+                "belong to another cfbridge project in this zone." if legacy else "")
         raise CfError(
-            f"{hostname} already has non-managed DNS record(s): {summary}. "
+            f"{hostname} already has non-managed DNS record(s): {summary}.{hint} "
             "Refusing to overwrite. Pass --force-dns (or set \"force_dns\": true "
             "in config.json) if that record is expendable."
         )
+    body = {"type": "CNAME", "name": hostname, "content": target, "proxied": True, "ttl": 1,
+            "comment": stamp}
+    reuse = None
     for rec in existing:
         if rec.get("type") != "CNAME":
             continue
-        if not _is_managed(rec, target) and not allow_overwrite:
+        if not mine(rec) and not allow_overwrite:
             continue
-        api("PUT", f"/zones/{zone_id}/dns_records/{rec['id']}",
-            {"type": "CNAME", "name": hostname, "content": target, "proxied": True, "ttl": 1,
-             "comment": MANAGED_COMMENT})
+        reuse = rec
+        break
+    if allow_overwrite:
+        # A CNAME cannot be created (or kept) next to an A/AAAA of the
+        # same name, so an explicit overwrite has to clear those first.
+        for rec in existing:
+            if rec is reuse or rec.get("type") not in CNAME_CONFLICT_TYPES:
+                continue
+            api("DELETE", f"/zones/{zone_id}/dns_records/{rec['id']}")
+    if reuse is not None:
+        api("PUT", f"/zones/{zone_id}/dns_records/{reuse['id']}", body)
         return "updated"
     # A create is not idempotent: a retried POST after a lost response
     # would add a second record for the same name. Let it fail loudly —
     # the next `up` re-reads the zone and converges.
-    api("POST", f"/zones/{zone_id}/dns_records",
-        {"type": "CNAME", "name": hostname, "content": target, "proxied": True, "ttl": 1,
-         "comment": MANAGED_COMMENT}, idempotent=False)
+    api("POST", f"/zones/{zone_id}/dns_records", body, idempotent=False)
     return "created"
 
 
 def delete_tunnel_and_dns(account_id: str, zone_id: str, tunnel_id: str, hostnames: list[str]) -> list[str]:
     """Delete DNS records owned by this tunnel, then the tunnel itself.
 
-    Returns summaries of the records deleted. Records that merely share
-    a hostname (someone else's CNAME, an unrelated A record) are left
-    alone.
+    Returns summaries of the records deleted. Only records that point
+    at this tunnel are deleted: records that merely share a hostname
+    (someone else's CNAME, an unrelated A record, another project's
+    record carrying the shared marker) are left alone.
     """
     target = dns_target(tunnel_id)
     if isinstance(hostnames, str):  # tolerate a single hostname by mistake
@@ -321,7 +359,7 @@ def delete_tunnel_and_dns(account_id: str, zone_id: str, tunnel_id: str, hostnam
     deleted: list[str] = []
     for h in hostnames:
         for rec in _get_paged(f"/zones/{zone_id}/dns_records?name={h}"):
-            if str(rec.get("content", "")) != target and rec.get("comment") != MANAGED_COMMENT:
+            if str(rec.get("content", "")) != target:
                 continue
             api("DELETE", f"/zones/{zone_id}/dns_records/{rec['id']}")
             deleted.append(f"{rec.get('type')} {rec.get('name')} -> {rec.get('content')}")

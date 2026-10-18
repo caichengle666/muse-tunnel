@@ -53,7 +53,10 @@ class DnsGuardTests(unittest.TestCase):
         self.assertEqual(cf_api.ensure_dns(ZONE, "files.example.com", TUNNEL), "created")
         body = self.api.calls[-1][2]
         self.assertEqual(body["content"], f"{TUNNEL}.cfargotunnel.com")
-        self.assertEqual(body["comment"], cf_api.MANAGED_COMMENT)
+        # The marker names the tunnel: a shared marker cannot tell two
+        # projects in one zone apart.
+        self.assertEqual(body["comment"], cf_api.managed_comment(TUNNEL))
+        self.assertTrue(body["comment"].startswith(cf_api.MANAGED_COMMENT))
         self.assertTrue(body["proxied"])
         # Creating a record is not repeatable: a retried POST after a lost
         # response would add a second record for the same name.
@@ -98,14 +101,78 @@ class DnsGuardTests(unittest.TestCase):
         self.assertEqual(self.api.calls[-1][2]["content"], f"{TUNNEL}.cfargotunnel.com")
 
     def test_updates_our_own_record_in_place(self):
+        # A record of this project's previous tunnel is still ours.
         self.api.script[("GET", "/zones/" + ZONE + "/dns_records")] = {
             "success": True,
             "result": [{"id": "r3", "type": "CNAME", "name": "files.example.com",
                         "content": "old-tunnel.cfargotunnel.com",
-                        "comment": cf_api.MANAGED_COMMENT}],
+                        "comment": cf_api.managed_comment("old-tunnel")}],
+        }
+        self.assertEqual(cf_api.ensure_dns(ZONE, "files.example.com", TUNNEL,
+                                           prior_tunnel_ids=["old-tunnel"]), "updated")
+        self.assertIn(("PUT", f"/zones/{ZONE}/dns_records/r3"), self.api.paths())
+        self.assertEqual(self.api.calls[-1][2]["comment"], cf_api.managed_comment(TUNNEL))
+
+    def test_record_with_our_tunnel_marker_is_ours(self):
+        self.api.script[("GET", "/zones/" + ZONE + "/dns_records")] = {
+            "success": True,
+            "result": [{"id": "r4", "type": "CNAME", "name": "files.example.com",
+                        "content": "drifted.example.net",
+                        "comment": cf_api.managed_comment(TUNNEL)}],
         }
         self.assertEqual(cf_api.ensure_dns(ZONE, "files.example.com", TUNNEL), "updated")
-        self.assertIn(("PUT", f"/zones/{ZONE}/dns_records/r3"), self.api.paths())
+
+    def test_m3_shared_marker_of_another_project_is_not_ours(self):
+        """Two projects in one zone: B's record carries the (old) shared
+        marker and points at B's tunnel. A's `up` must not repoint it."""
+        self.api.script[("GET", "/zones/" + ZONE + "/dns_records")] = {
+            "success": True,
+            "result": [{"id": "rb", "type": "CNAME", "name": "files.example.com",
+                        "content": "T2.cfargotunnel.com", "comment": cf_api.MANAGED_COMMENT}],
+        }
+        with self.assertRaises(cf_api.CfError) as ctx:
+            cf_api.ensure_dns(ZONE, "files.example.com", "T1")
+        self.assertIn("another cfbridge project", str(ctx.exception))
+        self.assertEqual([m for m, _ in self.api.paths()], ["GET"])
+
+    def test_m3_another_projects_tunnel_marker_is_not_ours(self):
+        self.api.script[("GET", "/zones/" + ZONE + "/dns_records")] = {
+            "success": True,
+            "result": [{"id": "rb", "type": "CNAME", "name": "files.example.com",
+                        "content": "T2.cfargotunnel.com", "comment": cf_api.managed_comment("T2")}],
+        }
+        with self.assertRaises(cf_api.CfError):
+            cf_api.ensure_dns(ZONE, "files.example.com", "T1")
+
+    def test_l3_force_dns_clears_a_records_before_creating_the_cname(self):
+        self.api.script[("GET", "/zones/" + ZONE + "/dns_records")] = {
+            "success": True,
+            "result": [{"id": "a1", "type": "A", "name": "files.example.com", "content": "203.0.113.9"},
+                       {"id": "a6", "type": "AAAA", "name": "files.example.com", "content": "2001:db8::1"},
+                       {"id": "t1", "type": "TXT", "name": "files.example.com", "content": "keep me"}],
+        }
+        self.assertEqual(cf_api.ensure_dns(ZONE, "files.example.com", TUNNEL, allow_overwrite=True),
+                         "created")
+        paths = self.api.paths()
+        self.assertIn(("DELETE", f"/zones/{ZONE}/dns_records/a1"), paths)
+        self.assertIn(("DELETE", f"/zones/{ZONE}/dns_records/a6"), paths)
+        self.assertNotIn(("DELETE", f"/zones/{ZONE}/dns_records/t1"), paths)
+        # The deletes come before the create, or Cloudflare rejects it.
+        post_at = paths.index(("POST", f"/zones/{ZONE}/dns_records"))
+        self.assertLess(paths.index(("DELETE", f"/zones/{ZONE}/dns_records/a1")), post_at)
+
+    def test_l3_force_dns_rewrites_a_cname_and_drops_a_records(self):
+        self.api.script[("GET", "/zones/" + ZONE + "/dns_records")] = {
+            "success": True,
+            "result": [{"id": "c1", "type": "CNAME", "name": "files.example.com", "content": "x.example.net"},
+                       {"id": "a1", "type": "A", "name": "files.example.com", "content": "203.0.113.9"}],
+        }
+        self.assertEqual(cf_api.ensure_dns(ZONE, "files.example.com", TUNNEL, allow_overwrite=True),
+                         "updated")
+        paths = self.api.paths()
+        self.assertIn(("PUT", f"/zones/{ZONE}/dns_records/c1"), paths)
+        self.assertIn(("DELETE", f"/zones/{ZONE}/dns_records/a1"), paths)
+        self.assertNotIn(("DELETE", f"/zones/{ZONE}/dns_records/c1"), paths)
 
 
 class DeleteTests(unittest.TestCase):
@@ -132,6 +199,19 @@ class DeleteTests(unittest.TestCase):
         self.assertNotIn(("DELETE", f"/zones/{ZONE}/dns_records/theirs"), self.api.paths())
         self.assertNotIn(("DELETE", f"/zones/{ZONE}/dns_records/a-record"), self.api.paths())
         self.assertIn(("DELETE", f"/accounts/acct/cfd_tunnel/{TUNNEL}"), self.api.paths())
+
+    def test_m3_teardown_leaves_another_projects_marked_record(self):
+        self.api.script[("GET", "/zones/" + ZONE + "/dns_records")] = {
+            "success": True,
+            "result": [{"id": "rb", "type": "CNAME", "name": "files.example.com",
+                        "content": "T2.cfargotunnel.com", "comment": cf_api.MANAGED_COMMENT},
+                       {"id": "rb2", "type": "CNAME", "name": "files.example.com",
+                        "content": "T2.cfargotunnel.com", "comment": cf_api.managed_comment("T1")}],
+        }
+        deleted = cf_api.delete_tunnel_and_dns("acct", ZONE, "T1", ["files.example.com"])
+        self.assertEqual(deleted, [])
+        self.assertNotIn(("DELETE", f"/zones/{ZONE}/dns_records/rb"), self.api.paths())
+        self.assertNotIn(("DELETE", f"/zones/{ZONE}/dns_records/rb2"), self.api.paths())
 
     def test_accepts_a_bare_hostname_string(self):
         deleted = cf_api.delete_tunnel_and_dns("acct", ZONE, TUNNEL, "files.example.com")

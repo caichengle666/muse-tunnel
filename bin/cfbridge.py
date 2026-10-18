@@ -76,6 +76,7 @@ DEFAULT_BRIDGE_PORT = 17844
 # CFBRIDGE_CLOUDFLARED_SHA256 to enforce a checksum — Cloudflare does
 # not publish per-asset checksum files, so verification is available
 # but not automatic.
+__version__ = "0.6.0"  # muse-tunnel release; see CHANGELOG.md
 CLOUDFLARED_VERSION = "2026.9.3"
 RELEASE_URL = "https://github.com/cloudflare/cloudflared/releases/download/{version}/{asset}"
 # GitHub's "newest release" redirect has a different shape than a tagged
@@ -2548,6 +2549,7 @@ def build_parser() -> argparse.ArgumentParser:
         description="Cloudflare named-tunnel stacks for Muse-style sandboxes: doctor, init, "
                     "add-service, demo, up, status, verify, down, install-autostart, teardown.",
         formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--version", action="version", version=f"cfbridge {__version__}")
     ap.add_argument("--project", help="project dir (default: $CFBRIDGE_PROJECT or cwd)")
     sub = ap.add_subparsers(dest="cmd", required=True)
 

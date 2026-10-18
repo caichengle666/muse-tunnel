@@ -17,7 +17,14 @@
 | `refusing to render ...: value contains a newline` | config.json 对应字段 | 字段值里有换行（会往 unit 里注入指令） | 去掉换行；`start_cmd` 需要多步就用 `bash -c '...'` 写在一行 |
 | `unresolved template placeholder(s)` | 改过 templates/ | 模板与渲染方占位符对不上 | 按 CI 的占位符白名单对照修，不要留 `{{未定义}}` |
 | 沙盒重启后全挂超过 2 分钟 | hook 是否 enable；run/managed-units.txt 在否 | hook 没装或没 enable | 跑 `install-autostart` 并按输出完成 hooks add/dry_run/enable |
-| 重启后 unit 报 already running 但实际没进程 | run/*.pid 残留（旧手动模式遗留） | systemd 模式不用 pidfile | 忽略 pidfile，以 `systemctl` 与 hook 的 /proc 校验为准 |
+| 重启后 unit 报 already running 但实际没进程 | run/*.pid 残留（旧手动模式遗留） | systemd 模式不用 pidfile | 忽略 pidfile，以 `systemctl is-active` 和本地 health 为准（hook 判断用的就是这两样） |
+| `down` 之后服务又自己起来了 | 有没有 `run/stopped` | 旧版本的 `down` 不写停用标记，hook 下一轮就把服务重装重启了 | 现在 `down` 会写 `run/stopped`，hook 和 `doctor --fix` 见到就不动；`up` 才清掉它。`teardown` 还会删 `run/managed-units.txt` 和 `systemd/` 副本，记得按提示 `hooks.remove` |
+| 设了 `http_proxy` 后 hook 每分钟重启整套服务 / `status` 本地 health 结果离谱 | hook 输出、`status` 的 `local=` | curl 和 urllib 都读 `http_proxy`，而且都不会自动绕开 127.0.0.1：本地探测被发到代理那台机器上（假阳性），或者遇到死代理直接失败（假阴性） | 已修：本地探测一律不走代理（curl `--noproxy '*'`、urllib 空 `ProxyHandler`）；hook 也只重启自己 health 不过的服务 unit，5 分钟最多修一次 |
+| `CFBRIDGE_PROXY` 是死值，`secrets/proxy.env` 里那条反而被它覆盖了 | proxy.env 内容 | 旧版本只要环境里有值就照抄进去，不探活 | 已修：`heal_deps`、`sync-proxy`（hook 每轮调用）只写探活通过的 URL；`CFBRIDGE_PROXY` 死了会改用文件里还能用的那条 |
+| `up` 报 `non-managed DNS record(s)`，提示可能属于另一个 cfbridge 项目 | 记录的注释和指向 | 记录只带旧版共享注释，却指向别的隧道。旧版本会直接改写它，从而抢走同 zone 另一个项目的子域名 | 确认那确实是本项目以前的记录、可以覆盖，再 `up --force-dns` |
+| `--force-dns` 时报 CNAME 与 A 冲突 | 该名字下的记录类型 | Cloudflare 不允许 CNAME 和 A/AAAA 同名共存 | 已修：`--force-dns` 会先删掉同名的 A/AAAA 再建 CNAME |
+| `project path ... contains characters that are unsafe` | 项目路径 | 路径会原样进 root 执行的 hook 和 systemd 单元，引号、`$`、反引号可以被当成命令执行，空格和 `%` 会弄坏 unit | 把项目挪到只含 `[A-Za-z0-9._/+,:=@~-]` 的路径 |
+| 服务 unit 起不来，`Executable path is not absolute` / `date +%s` 输出不对 | `systemd/<unit>.service` 里的 `ExecStart=` | systemd 不展开 `~`，不接受相对路径，还会把 `%x` 当 specifier | `add-service` 和渲染时会展开开头的 `~`，并把 `%` 转义；相对路径（带 `/`）注册时直接拒绝 |
 | 两个项目互相影响 | 端口占用 | bridge_port 或服务 port 撞了 | `up` 会自动把 bridge_port 顺延到空闲口并回写 config；服务 port 全局规划后再 add-service。unit 名已带路径哈希，不会再互相覆盖 |
 | `up` 报 `needs root` | — | 当前不是 root | 用 root 跑 `up`/`down`/`teardown`（要写 `/etc/systemd/system`）；只读类的 doctor/status/verify 不需要 |
 | cloudflared 下载后 `does not run` | 下载日志里的 sha256 | 架构不匹配或二进制损坏 | 设 `CFBRIDGE_CLOUDFLARED_ASSET` 指定资产，或 `CFBRIDGE_CLOUDFLARED_SHA256` 强制校验；也可手动放一份到 `<项目>/bin/cloudflared` |
@@ -31,8 +38,9 @@
 | 第一次 `doctor` 说 direct、第二次说 bridge（或反之） | `direct TLS 7844 (verified)` | 直连探针原先也是顺序试候选，单个不理人的 IP 就能翻转结论 | 已修：`direct_edge_ok` 并发拨候选，谁先验通证书算谁。反复翻转仍出现就查 `direct_ok` 两侧的日志/代理，别直接改 `mode` |
 | 代理轮换后全挂（env 里还是旧 URL） | `doctor` 的 `proxy` 行 | `HTTPS_PROXY` 指向的代理已经不可用 | `doctor --fix` 会去 `secrets/proxy.env` 里找仍在工作的那条并采用；都没有就 `export CFBRIDGE_PROXY=<新代理>` 再 `up` |
 | 桥 unit 起不来、日志空 | `systemctl status` 提示 `EnvironmentFile ... not found` | `secrets/proxy.env` 丢了（旧模板会把 unit 直接判失败） | 现在 unit 用 `EnvironmentFile=-` 不再硬失败；`doctor --fix` 会重写该文件（它是桥唯一拿代理的途径） |
-| 重启后服务 unit 反复重启、日志报 `No such file or directory: .../venv/bin/python` | `logs/svc-<name>.log` | 服务 venv 没建或被清（以前只有 `init` 会建） | `up` / `doctor --fix` 会自动重建 venv 并装 `websockets>=12,<16`；服务需要别的依赖就自己装进同一个 venv |
-| cloudflared 进程是 active 但公网 1033 | 日志尾部有没有 `Registered tunnel connection` | 「进程活着」不等于「隧道注册上了」 | `doctor --fix` 会把这种状态判为不健康并重启 cloudflared；`up` 也只在看到注册日志后才算起来 |
+| 重启后服务 unit 反复重启、日志报 `No such file or directory: .../venv/bin/python` | `logs/svc-<name>.log` | 服务 venv 没建或被清（以前只有 `init` 会建） | `up` / `doctor --fix` 会自动重建 venv 并装 `websockets>=14,<16`；服务需要别的依赖就自己装进同一个 venv |
+| cloudflared 进程是 active 但公网 1033 | 最后一次 `Starting tunnel` 之后有没有 `Registered tunnel connection` | 「进程活着」不等于「隧道注册上了」 | `doctor --fix` 会把「重启后一直没注册」判为不健康并重启 cloudflared；`up` 也只在看到注册日志后才算起来。日志被滚动、两种标记都找不到时不会重启（旧版本只看日志尾部 8 KiB，会误伤跑久了的健康隧道） |
+| `doctor --fix` 输出 `SKIPPED …` / `FAILED to start …` | 那一行 | 不是 root、没有 systemd，或者 unit 还没装（`demo` 之后、`up` 之前） | 按提示处理：需要 root 就用 root 跑；unit 没装就先 `up`。报告其余部分照常输出 |
 | 保活 hook 报 recovered via doctor --fix | 项目 `logs/last-doctor-fix.log` | hook 修好的是依赖层问题（venv/cloudflared/端口/proxy.env），不是网络恢复 | 看那份日志确认修了什么；同类问题反复出现说明依赖在持续丢（比如 /home 之外放了东西），按日志里的项从根上修 |
 | 隧道健康（日志有 `Registered`）、公网却每条请求 502 | 源站是 `https://` 吗 | **originServerName 为空时 cloudflared 拿 service URL 的主机名当证书名**，`https://127.0.0.1:8443` 要求证书叫 `127.0.0.1` | 重新 `add-service --origin-tls-name <证书里的名字>`；loopback 自签直接 `--origin-no-verify`（注册时 loopback 会自动这么设）；私有 CA 加 `--origin-request '{"caPool":"..."}'`。手改 config 也会被 `up` 拦下并提示补哪个键 |
 | `add-service` 报 `origin ... is raw TCP stream` | — | `tcp://` / `ssh://` / `rdp://` 是裸 TCP，浏览器打不开 | 确认确实要挂：加 `--allow-tcp-origin`，然后告诉用户客户端得起 `cloudflared access tcp --hostname <host> --url 127.0.0.1:<port>`。要浏览器直开就用 `http://` 或 `unix:` 源站 |

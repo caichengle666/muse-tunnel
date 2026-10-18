@@ -1,5 +1,60 @@
 # CHANGELOG
 
+## 未发布 — 按 1bfa0f3 审查报告修复（H1–H2、M1–M8、L1–L8）
+
+### 高
+- **H1 本地探测不走代理**：`http_get(..., direct=True)` 用空 `ProxyHandler` 的 opener，新增 `local_get()`。
+  `wait_local_health`/`status` 的本地 health 都走它。hook 里 curl 加 `--noproxy '*'`，没有 curl 时用
+  python 的空 `ProxyHandler`。以前设了 `http_proxy`，本地 health 会被代理那台机器的 127.0.0.1 应答
+  （假阳性），遇到死代理则直接失败（假阴性），后者会让 hook 每分钟重启整套服务。
+- **H2 `down` 就是停**：`down` 先写 `run/stopped` 再停 unit。hook 一开头、`heal_stack()` 都认这个标记，
+  `heal_deps()` 也不再为已停用的栈重渲染 unit；`up` 会清掉它，`status` 会显示停用状态。`teardown` 也写这个标记，
+  并删除 `run/managed-units.txt` 和 `systemd/` 里列出的单元副本，再打印 `hooks.remove` 提示。
+
+### 中
+- **M1 hook/unit 注入**：项目路径与 skill 路径在 `init`、`render_units`、`install-autostart` 里按白名单
+  `[A-Za-z0-9._/+,:=@~-]` 校验，不合规直接拒绝（以前带 `"`/`$`/反引号的路径会在 root hook 里执行命令）。
+- **M2 代理只写验证过的值**：`refresh_proxy_env(proj, url)` 接受已探活的 URL；`heal_deps` 先写文件、再采用，
+  并在 `CFBRIDGE_PROXY` 是死值时一并改掉它。文件来源的 URL 会保留文件里原有的 `NO_PROXY` 等行。hook 不再自己
+  照抄环境变量写 proxy.env，改为每轮调用新子命令 `cfbridge sync-proxy`（先探活，只写能连上的那条）。
+- **M3 DNS 归属带隧道 ID**：注释改为 `cf-tunnel-bridge managed tunnel=<id>`。`_is_managed` 只认三种记录：指向本隧道的、
+  指向本项目之前用过的隧道的（`ensure_tunnel_stack` 传 `prior_tunnel_ids`）、带本隧道注释的；只带旧版共享注释、
+  却指向别处的记录按他人处理，报错信息会提示「可能属于另一个 cfbridge 项目」。`delete_tunnel_and_dns` 只删
+  `content` 真正指向本隧道的记录。兼容性：老项目的记录本来就指向本隧道，`up` 结果仍是 `unchanged`，`teardown` 照常删除。
+- **M4 `auth=key` 不再让人误以为安全**：`add-service` 会明确提示「key 由源站校验，cfbridge 不拦截，可用 Cloudflare
+  Access」；`verify` 不带 `--ws` 时，对 key 服务额外打出 `auth NOT verified for …`（退出码和最后一行不变）。文档同步改写。
+- **M5 `start_cmd` 落地规则**：开头的 `~` 展开（`add-service` 存展开后的值，渲染时也会对旧配置再展开一次）；带 `/` 的
+  可执行文件必须是绝对路径（在 `validate_service` 里检查，允许 systemd 的 `-@:+!` 前缀）；渲染时把 `%` 转义成 `%%`
+  （`workdir` 也一样）；`$` 只提示不转义。`services_needing_venv` 能识别 `~/…/venv/bin/python` 这种写法。
+- **M6 hook 只修坏的那一个**：按 unit 拆分判断。没在跑的 unit 按「桥 → 服务 → cloudflared」顺序 `start`；
+  active 但 health 不过的托管服务 unit 只 `restart` 它自己；健康的桥和 cloudflared 不碰。修复有 5 分钟节流
+  （`run/hook-last-repair`）。只做路由的服务挂了不重启、不跑 `doctor --fix`，只节流 wake。只在副本与 /etc 不一致时才 `cp`。
+- **M7 注册判定不看固定尾窗**：新增 `tunnel_registration_state()`。在日志末尾最多 16 MiB 里比较最后一次 `Starting tunnel`
+  和最后一次 `Registered tunnel connection` 的先后；两者都找不到时判为 `unknown`，不重启。`heal_stack` 只在
+  `unregistered` 时才 bounce。`start_stack` 也不再为没被重启的 active unit 白等 45 秒。
+- **M8 `doctor --fix` 不再中途 die**：`heal_stack` 在没有 systemd、或不是 root 时返回 `SKIPPED …`；`start_stack(check=False,
+  failed=…)` 把启动失败记成 `FAILED to start …`，报告照常打完。`ensure_cloudflared` 发现项目副本跑不起来，会把它改名为
+  `cloudflared.broken` 再重新安装。
+
+### 低
+- **L1** `CFBRIDGE_CLOUDFLARED_VERSION=latest` 改用 `…/releases/latest/download/<asset>`（新增 `cloudflared_download_url()`）。
+  这是按 GitHub 的 URL 规则改的，没有联网验证。
+- **L2** `bridge_port_free` 探测时设 `SO_REUSEADDR`，桥自己留下的 TIME_WAIT 不再算「被占」；自己的桥处于 `activating`/`reloading`
+  也算自己占着（`own_bridge_holds_port`）。`heal_deps` 换了端口后，已安装的 unit 会按新端口重新渲染并安装。
+- **L3** `--force-dns` 先删除同名的 A/AAAA（以及不复用的 CNAME），再 PUT/POST CNAME。
+- **L4** DoH 结果按 region 交错排列；桥每轮竞速全败后，窗口顺移一个竞速宽度（`rotate()`）。探针的第二轮也换下一批候选。
+- **L5** demo 源站只认 `X-Bridge-Key` 请求头，并用 `hmac.compare_digest` 比较，去掉了 `?key=`。
+- **L6** `WEBSOCKETS_REQ` 改为 `websockets>=14,<16`。12/13 没法离线安装验证，所以只是保守收窄下限。已有 venv 不受影响
+  （只有缺 venv 时才会安装）。
+- **L7** 文档与代码对齐：`public_confirmed` 只是同意记录，不是安全边界；cloudflared 校验流程照实描述；loopback 列表补上 `0.0.0.0`；
+  troubleshooting 里删掉不存在的「hook 的 /proc 校验」。
+- **L8** 「是否在 $HOME 下」改用 `os.path.commonpath`（`under_home()`）判断，`doctor`、`init`、`teardown --purge-project` 都改用它。
+
+### 测试
+新增 `tests/test_review_fixes.py`（46 项）。其中 hook 是真渲染后用 bash 跑的，配一个假 `systemctl` 和桩 runtime，覆盖停用标记、
+死代理下的 health、只重启坏掉的那个服务、修复节流、只做路由的服务失败、proxy.env 不被死值覆盖等场景。现有测试按新语义调整了
+4 处（DNS 注释、`heal_stack` 需要 root 和 systemd）。全部共 **237 项**通过。
+
 ## 未发布 — 依赖探针不再误报（沿用桥的并行竞速）
 
 用户实测报上来的：第一次 `doctor` 把 `edge via proxy` 判成 **MISSING**，还提示「检查代理对 7844 的

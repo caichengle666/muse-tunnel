@@ -24,9 +24,15 @@ Subcommands:
     status            units + local/public health
     verify            public end-to-end checks (HTTPS health, WS auth)
     prune-logs        enforce the log retention window
-    down              stop managed units (tunnel/DNS stay)
+    sync-proxy        write secrets/proxy.env from a proxy that answers
+                      (the keepalive hook calls it every poll)
+    down              stop managed units and leave run/stopped so the
+                      hook / doctor --fix do not bring them back (tunnel
+                      and DNS stay); `up` clears the marker
     install-autostart render the keepalive hook script + next steps
-    teardown          stop units, delete DNS + tunnel (--purge-project)
+    teardown          stop units, forget them (managed-units.txt and the
+                      systemd/ copies), delete DNS + tunnel
+                      (--purge-project)
 
 Credentials come from the custom.cloudflare connector or
 CF_API_TOKEN (see cf_api.py). Secret values are never printed.
@@ -42,6 +48,7 @@ import os
 import platform
 import re
 import secrets as pysecrets
+import shlex
 import shutil
 import socket
 import ssl
@@ -71,6 +78,9 @@ DEFAULT_BRIDGE_PORT = 17844
 # but not automatic.
 CLOUDFLARED_VERSION = "2026.9.3"
 RELEASE_URL = "https://github.com/cloudflare/cloudflared/releases/download/{version}/{asset}"
+# GitHub's "newest release" redirect has a different shape than a tagged
+# download (`latest/download`, not `download/latest`).
+LATEST_RELEASE_URL = "https://github.com/cloudflare/cloudflared/releases/latest/download/{asset}"
 ARCH_ASSETS = {
     "x86_64": "cloudflared-linux-amd64",
     "amd64": "cloudflared-linux-amd64",
@@ -111,6 +121,62 @@ def die(msg: str) -> "SystemExit":
 def project_dir(args) -> str:
     p = getattr(args, "project", None) or os.environ.get("CFBRIDGE_PROJECT") or os.getcwd()
     return os.path.abspath(os.path.expanduser(p))
+
+
+# Paths that get pasted into the bash hook (inside double quotes, run
+# as root every minute) and into systemd units (where spaces split
+# arguments and `%` is a specifier). Anything outside this set is either
+# a shell metacharacter or a systemd one, so it is refused up front
+# rather than escaped differently for each consumer.
+SAFE_PATH_RE = re.compile(r"[A-Za-z0-9._/+,:=@~-]+")
+
+
+def require_safe_path(what: str, path: str) -> str:
+    if not SAFE_PATH_RE.fullmatch(path or ""):
+        die(f"{what} {path!r} contains characters that are unsafe in the keepalive hook "
+            "or systemd units (allowed: letters, digits and ._/+,:=@~-); "
+            "move the project to a plain path")
+    return path
+
+
+def under_home(path: str, home: str | None = None) -> bool:
+    """Is `path` inside $HOME (not merely sharing a string prefix)?
+
+    `"/root2".startswith("/root")` is True; a path comparison is not.
+    """
+    home = os.path.abspath(home or os.path.expanduser("~"))
+    path = os.path.abspath(path)
+    try:
+        return os.path.commonpath([path, home]) == home
+    except ValueError:
+        return False
+
+
+# `cfbridge down` leaves this behind so the keepalive hook and
+# `doctor --fix` know the stack was stopped on purpose; `up` clears it.
+STOPPED_MARKER = os.path.join("run", "stopped")
+
+
+def stopped_marker(proj: str) -> str:
+    return os.path.join(proj, STOPPED_MARKER)
+
+
+def is_stopped(proj: str) -> bool:
+    return os.path.exists(stopped_marker(proj))
+
+
+def mark_stopped(proj: str) -> None:
+    os.makedirs(os.path.join(proj, "run"), exist_ok=True)
+    with open(stopped_marker(proj), "w", encoding="utf-8") as f:
+        f.write(f"stopped by cfbridge down at {int(time.time())}\n")
+
+
+def clear_stopped(proj: str) -> bool:
+    try:
+        os.remove(stopped_marker(proj))
+        return True
+    except FileNotFoundError:
+        return False
 
 
 def slugify(name: str) -> str:
@@ -195,26 +261,47 @@ def write_secret(proj: str, name: str, value: str) -> None:
     write_private(os.path.join(d, name), value.strip() + "\n", 0o600)
 
 
-def refresh_proxy_env(proj: str) -> bool:
-    """Persist the effective proxy settings into secrets/proxy.env.
+def _read_env_file(path: str) -> dict[str, str]:
+    out: dict[str, str] = {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f.read().splitlines():
+                key, sep, val = line.strip().partition("=")
+                if sep and key.strip():
+                    out[key.strip()] = val.strip()
+    except OSError:
+        pass
+    return out
+
+
+def refresh_proxy_env(proj: str, url: str | None = None) -> bool:
+    """Persist the proxy settings into secrets/proxy.env.
 
     Returns True only when the file was (re)written, so callers can log
-    a real change instead of noise. CFBRIDGE_PROXY wins over the usual
-    variables, which is how an agent that knows the sandbox proxy URL
-    pins it for the units without exporting anything globally.
+    a real change instead of noise. Without `url`, the environment's
+    value is used (CFBRIDGE_PROXY wins over the usual variables, which
+    is how an agent that knows the sandbox proxy URL pins it for the
+    units without exporting anything globally). Callers that probed the
+    proxy pass the *verified* URL: writing the environment's value
+    instead would overwrite a working file entry with a dead one.
     """
-    url = proxy_from_env()
+    env_url = proxy_from_env()
+    url = (url or env_url or "").strip()
     if not url:
         return False
-    lines = [f"HTTPS_PROXY={url}", f"https_proxy={url}"]
-    for k in ("HTTP_PROXY", "http_proxy", "NO_PROXY", "no_proxy"):
-        v = (os.environ.get(k) or "").strip()
-        if v:
-            lines.append(f"{k}={v}")
     d = os.path.join(proj, "secrets")
     os.makedirs(d, exist_ok=True)
     os.chmod(d, 0o700)
     path = os.path.join(d, "proxy.env")
+    # The companion variables come from wherever the chosen URL came
+    # from: the environment when it agrees, otherwise the file's own
+    # lines (the environment's companions are as stale as its URL).
+    previous = {} if url == env_url else _read_env_file(path)
+    lines = [f"HTTPS_PROXY={url}", f"https_proxy={url}"]
+    for k in ("HTTP_PROXY", "http_proxy", "NO_PROXY", "no_proxy"):
+        v = (os.environ.get(k) or "").strip() if url == env_url else previous.get(k, "")
+        if v:
+            lines.append(f"{k}={v}")
     content = "\n".join(lines) + "\n"
     if os.path.exists(path):
         try:
@@ -230,15 +317,34 @@ def refresh_proxy_env(proj: str) -> bool:
 UA = {"User-Agent": "cfbridge/1.0 (health-check)"}
 
 
-def http_get(url: str, timeout: float = 10) -> tuple[int, str]:
+# An opener with no proxy handler at all. urllib reads HTTP_PROXY /
+# http_proxy and does NOT exempt 127.0.0.1 on its own, so a loopback
+# health probe would otherwise be answered by whatever sits on the
+# proxy host's loopback (false positive) or fail on a dead proxy
+# (false negative).
+_NOPROXY_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def http_get(url: str, timeout: float = 10, *, direct: bool = False) -> tuple[int, str]:
+    """GET a URL. direct=True bypasses every proxy (use it for loopback)."""
     req = urllib.request.Request(url, headers=UA)
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+    opener = _NOPROXY_OPENER if direct else urllib.request.build_opener()
+    with opener.open(req, timeout=timeout) as resp:
         return resp.status, resp.read().decode("utf-8", "replace")
+
+
+def local_get(port: int, path: str, timeout: float = 4) -> tuple[int, str]:
+    """Health probe of a loopback origin, never through a proxy."""
+    return http_get(f"http://127.0.0.1:{port}{path}", timeout=timeout, direct=True)
 
 
 def bridge_port_free(port: int) -> bool:
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
+        # Same option the bridge itself listens with: without it a
+        # TIME_WAIT left by the bridge's own last restart reads as
+        # "someone else holds the port" and the port drifts for nothing.
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         s.bind(("127.0.0.1", port))
         return True
     except OSError:
@@ -255,11 +361,7 @@ def ensure_bridge_port(proj: str, cfg: dict) -> None:
     if bridge_port_free(port):
         # free, or our own bridge already owns it
         return
-    own_active = False
-    if systemctl_path():
-        names = unit_names(proj, cfg, "bridge")
-        own_active = systemctl("is-active", names["bridge"]).stdout.strip() == "active"
-    if own_active:
+    if own_bridge_holds_port(proj, cfg):
         return
     for cand in range(port + 1, port + 30):
         if bridge_port_free(cand):
@@ -268,6 +370,18 @@ def ensure_bridge_port(proj: str, cfg: dict) -> None:
             save_config(proj, cfg)
             return
     die(f"no free bridge port near {port}; stop the other project's bridge or set bridge_port in config.json")
+
+
+# States in which our own bridge unit may legitimately hold its port:
+# a crash-restart shows up as "activating", not "active".
+OWN_UNIT_STATES = ("active", "activating", "reloading")
+
+
+def own_bridge_holds_port(proj: str, cfg: dict) -> bool:
+    if not systemctl_path():
+        return False
+    names = unit_names(proj, cfg, "bridge")
+    return systemctl("is-active", names["bridge"]).stdout.strip() in OWN_UNIT_STATES
 
 
 def run(cmd: list[str], check: bool = True) -> subprocess.CompletedProcess:
@@ -532,7 +646,11 @@ def cmd_prune_logs(args) -> None:
 # repaired where cfbridge is the owner.
 
 PROJECT_LAYOUT = ("secrets", "logs", "run", "systemd", "bin", "services")
-WEBSOCKETS_REQ = "websockets>=12,<16"
+# The demo origin uses the new asyncio API (process_request(connection,
+# request), ws.request), which `websockets.serve` only points at from
+# 14.0 on; 12/13 still serve the legacy implementation. Not verified
+# offline against 12/13 — the floor is raised conservatively.
+WEBSOCKETS_REQ = "websockets>=14,<16"
 # cloudflared prints this once the named tunnel is actually registered
 # with an edge. Anything earlier is "process is running", not "tunnel
 # works".
@@ -667,11 +785,15 @@ def probe_edge_via_proxy(proxy: tuple[str, int, str | None], ips: list[str],
     edge then holds its CONNECT for the whole timeout, so one unlucky
     round is enough to declare a working proxy broken.
     """
-    candidates = [ip for ip in ips[:edge_bridge.RACE_WIDTH_DEFAULT] if ip]
+    width = edge_bridge.RACE_WIDTH_DEFAULT
+    pool = [ip for ip in ips if ip]
+    candidates = pool[:width]
     if not candidates:
         return False, "no edge candidates to try (DoH lookup returned nothing)"
     attempts = max(1, rounds)
     for round_no in range(1, attempts + 1):
+        # A retry round looks at the next slice, like the bridge does.
+        candidates = edge_bridge.rotate(pool, (round_no - 1) * width)[:width]
         raced = edge_bridge.race_connect(candidates, proxy,
                                          connect_timeout=timeout,
                                          race_timeout=timeout + 4)
@@ -738,9 +860,46 @@ def services_needing_venv(proj: str, cfg: dict) -> list[str]:
     marker = venv_python(proj)
     out: list[str] = []
     for s in cfg.get("services") or []:
-        if s.get("start_cmd") and marker in s["start_cmd"]:
+        # `~/…/venv/bin/python` is the documented spelling; compare the
+        # expanded form or the venv self-heal never notices it.
+        if s.get("start_cmd") and marker in expand_start_cmd(s["start_cmd"]):
             out.append(s["name"])
     return out
+
+
+# ---------------------------------------------------------------- start_cmd
+#
+# start_cmd lands verbatim in ExecStart=, and systemd is not a shell:
+# it does not expand `~`, refuses an executable that has a `/` but is
+# not absolute, and treats `%x` as a unit specifier (`date +%s` breaks).
+
+_TILDE_TOKEN = re.compile(r"(?<!\S)~(?=/|\s|$)")
+# ExecStart= may prefix the executable with these modifier characters.
+_EXEC_PREFIX_CHARS = "-@:+!"
+
+
+def expand_start_cmd(cmd: str) -> str:
+    """Expand a bare leading `~` in each word to $HOME (systemd won't)."""
+    if not cmd or "~" not in cmd:
+        return cmd or ""
+    home = os.path.expanduser("~")
+    return _TILDE_TOKEN.sub(lambda _m: home, cmd)
+
+
+def start_cmd_executable(cmd: str) -> str:
+    """The program ExecStart= would run, modifier prefixes stripped."""
+    try:
+        argv = shlex.split(cmd)
+    except ValueError as e:
+        die(f"start_cmd cannot be parsed ({e}): {cmd!r}")
+    if not argv:
+        return ""
+    return argv[0].lstrip(_EXEC_PREFIX_CHARS)
+
+
+def systemd_escape_specifiers(value: str) -> str:
+    """`%` starts a unit specifier in most directives; keep it literal."""
+    return (value or "").replace("%", "%%")
 
 
 def ensure_venv(proj: str) -> str:
@@ -844,10 +1003,7 @@ def collect_deps(proj: str, cfg: dict, mode: str, timeout: float = 6) -> list[di
     if mode == "bridge":
         port = int(cfg.get("bridge_port") or DEFAULT_BRIDGE_PORT)
         free = bridge_port_free(port)
-        own = False
-        if not free and sctl:
-            names = unit_names(proj, cfg, "bridge")
-            own = systemctl("is-active", names["bridge"]).stdout.strip() == "active"
+        own = bool(not free and sctl and own_bridge_holds_port(proj, cfg))
         deps.append(dep("bridge port", free or own,
                         f"{port} " + ("free" if free else ("held by our own bridge unit" if own
                                                            else "in use by something else")),
@@ -889,14 +1045,22 @@ def heal_deps(proj: str, cfg: dict, mode: str) -> list[str]:
         done.append("generated secrets/bridge-key.txt")
 
     url, source, ok, _detail = resolve_proxy(proj)
+    # Only the verified URL is ever written back — and before it is
+    # adopted below, so a file-sourced value keeps the file's own
+    # companion lines (NO_PROXY, ...) instead of the environment's.
+    refreshed = bool(url and ok and refresh_proxy_env(proj, url))
     if url and ok and source != "env":
         # The environment lost (or rotated away from) a proxy the
         # project still remembers; adopt it for this process so every
-        # later step — DoH, tunnel API, unit rendering — agrees.
+        # later step — DoH, tunnel API, unit rendering — agrees. That
+        # includes a stale CFBRIDGE_PROXY, which would otherwise keep
+        # winning in proxy_from_env().
         for k in ("HTTPS_PROXY", "https_proxy"):
             os.environ[k] = url
+        if os.environ.get("CFBRIDGE_PROXY"):
+            os.environ["CFBRIDGE_PROXY"] = url
         done.append(f"adopted the working proxy from {source} (environment had none usable)")
-    if url and ok and refresh_proxy_env(proj):
+    if refreshed:
         done.append("refreshed secrets/proxy.env")
 
     if not cloudflared_version(os.path.join(proj, "bin", "cloudflared")):
@@ -908,6 +1072,15 @@ def heal_deps(proj: str, cfg: dict, mode: str) -> list[str]:
         ensure_bridge_port(proj, cfg)
         if cfg.get("bridge_port") != before:
             done.append(f"moved the bridge port to {cfg['bridge_port']}")
+            # Installed units still carry the old port (bridge --listen,
+            # cloudflared TUNNEL_EDGE). `up` re-renders anyway; doctor
+            # --fix and the hook do not, so do it here.
+            geteuid = getattr(os, "geteuid", None)
+            if (cfg.get("services") and not is_stopped(proj) and systemctl_path()
+                    and os.path.exists(os.path.join(proj, "run", "managed-units.txt"))
+                    and (geteuid is None or geteuid() == 0)):
+                install_units(proj, render_units(proj, cfg, mode))
+                done.append("re-rendered the installed units for the new bridge port")
 
     need_venv = services_needing_venv(proj, cfg)
     if need_venv and not os.path.exists(venv_python(proj)):
@@ -1014,12 +1187,16 @@ def start_order(names: dict[str, str]) -> list[str]:
     return out
 
 
-def start_stack(proj: str, cfg: dict, mode: str, restart: bool = True) -> list[str]:
+def start_stack(proj: str, cfg: dict, mode: str, restart: bool = True,
+                check: bool = True, failed: list[str] | None = None) -> list[str]:
     """Bring units up in dependency order, waiting on each layer.
 
     Returns the units that were actually (re)started. A unit left alone
     because it is already active is never bounced: restarting the bridge
     or cloudflared mid-flight would drop every live tunnel connection.
+
+    check=False keeps going when a unit fails to start (doctor must
+    still print its report); the failures are appended to `failed`.
     """
     names = unit_names(proj, cfg, mode)
     ordered = start_order(names)
@@ -1031,14 +1208,21 @@ def start_stack(proj: str, cfg: dict, mode: str, restart: bool = True) -> list[s
     bridge_unit = names.get("bridge", "")
     cf_unit = names.get("cloudflared", "")
 
-    def act(u: str) -> None:
+    def act(u: str) -> bool:
+        """True when `u` was (re)started now, i.e. there is something to
+        wait for. An already-active unit was left alone and a failed
+        start produces no readiness signal; neither is worth a wait."""
         if not restart and systemctl("is-active", u).stdout.strip() == "active":
-            return
-        systemctl(verb, u, check=True)
+            return False
+        r = systemctl(verb, u, check=check)
+        if r.returncode != 0:
+            if failed is not None:
+                failed.append(u)
+            return False
         started.append(u)
+        return True
 
-    if bridge_unit:
-        act(bridge_unit)
+    if bridge_unit and act(bridge_unit):
         port = int(cfg.get("bridge_port") or DEFAULT_BRIDGE_PORT)
         if not wait_port_listening("127.0.0.1", port, timeout=20):
             print(f"warning: {bridge_unit} is not listening on 127.0.0.1:{port}; see logs/bridge.log")
@@ -1047,8 +1231,7 @@ def start_stack(proj: str, cfg: dict, mode: str, restart: bool = True) -> list[s
             act(names[k])
     if cf_unit:
         offset = log_offset(os.path.join(proj, "logs", "cloudflared.log"))
-        act(cf_unit)
-        if not wait_tunnel_registered(proj, offset, timeout=45):
+        if act(cf_unit) and not wait_tunnel_registered(proj, offset, timeout=45):
             print("warning: cloudflared has not logged "
                   f"{CF_REGISTERED_MARK!r} yet; see logs/cloudflared.log "
                   "(in bridge mode this usually means the bridge or the proxy is down)")
@@ -1056,7 +1239,12 @@ def start_stack(proj: str, cfg: dict, mode: str, restart: bool = True) -> list[s
 
 
 def tunnel_registered_tail(proj: str, window: int = 8192) -> bool:
-    """Does the cloudflared log tail say the tunnel is registered?"""
+    """Does the cloudflared log tail say the tunnel is registered?
+
+    Kept for callers of the old API only. heal_stack() uses
+    tunnel_registration_state(): on a long-running healthy tunnel the
+    registration line scrolls out of any fixed tail window.
+    """
     path = os.path.join(proj, "logs", "cloudflared.log")
     try:
         size = os.path.getsize(path)
@@ -1066,6 +1254,38 @@ def tunnel_registered_tail(proj: str, window: int = 8192) -> bool:
             return CF_REGISTERED_MARK in f.read()
     except OSError:
         return False
+
+
+# cloudflared logs this once per process start, before any connection.
+CF_START_MARK = "Starting tunnel"
+REGISTRATION_SCAN_BYTES = 16 * 1024 * 1024
+
+
+def tunnel_registration_state(proj: str, max_bytes: int = REGISTRATION_SCAN_BYTES) -> str:
+    """"registered" | "unregistered" | "unknown", from cloudflared.log.
+
+    "Registered tunnel connection" is printed only when a connection is
+    set up, so on a long-running healthy tunnel it scrolls out of any
+    fixed tail window. What counts is ordering: the last registration
+    after the last process start means the running process registered.
+    A start with no registration after it means it never did. Neither
+    marker (log rotated away, file missing) is "unknown" — not a reason
+    to bounce a cloudflared that may be serving traffic.
+    """
+    path = os.path.join(proj, "logs", "cloudflared.log")
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as f:
+            if size > max_bytes:
+                f.seek(size - max_bytes)
+            data = f.read().decode("utf-8", "replace")
+    except OSError:
+        return "unknown"
+    reg = data.rfind(CF_REGISTERED_MARK)
+    start = data.rfind(CF_START_MARK)
+    if reg < 0 and start < 0:
+        return "unknown"
+    return "registered" if reg > start else "unregistered"
 
 
 def heal_stack(proj: str, cfg: dict, mode: str) -> list[str]:
@@ -1079,20 +1299,33 @@ def heal_stack(proj: str, cfg: dict, mode: str) -> list[str]:
     done: list[str] = []
     if not cfg.get("services"):
         return done
+    if is_stopped(proj):
+        # `cfbridge down` was deliberate; re-exposing the services here
+        # would undo it behind the user's back.
+        done.append("SKIPPED stack start: stopped on purpose by `cfbridge down` "
+                    "(run `cfbridge up` to bring it back)")
+        return done
+    if not systemctl_path():
+        done.append("SKIPPED unit start: systemctl not on PATH (cfbridge only manages systemd units)")
+        return done
+    geteuid = getattr(os, "geteuid", None)
+    if geteuid is not None and geteuid() != 0:
+        done.append("SKIPPED unit reinstall/start (needs root)")
+        return done
     gone = units_missing_from_etc(proj)
     if gone:
-        geteuid = getattr(os, "geteuid", None)
-        if geteuid is not None and geteuid() != 0:
-            done.append("SKIPPED unit reinstall (needs root): " + ", ".join(gone))
-        else:
-            install_units(proj, render_units(proj, cfg, mode))
-            done.append("reinstalled units missing from /etc: " + ", ".join(gone))
-    started = start_stack(proj, cfg, mode, restart=False)
+        install_units(proj, render_units(proj, cfg, mode))
+        done.append("reinstalled units missing from /etc: " + ", ".join(gone))
+    failed: list[str] = []
+    started = start_stack(proj, cfg, mode, restart=False, check=False, failed=failed)
     if started:
         done.append("started inactive units: " + ", ".join(started))
+    if failed:
+        done.append("FAILED to start (not installed yet? run `cfbridge up`): " + ", ".join(failed))
     names = unit_names(proj, cfg, mode)
     cf = names.get("cloudflared", "")
-    if cf and systemctl("is-active", cf).stdout.strip() == "active" and not tunnel_registered_tail(proj):
+    if (cf and systemctl("is-active", cf).stdout.strip() == "active"
+            and tunnel_registration_state(proj) == "unregistered"):
         offset = log_offset(os.path.join(proj, "logs", "cloudflared.log"))
         systemctl("restart", cf)
         if wait_tunnel_registered(proj, offset, timeout=45):
@@ -1202,7 +1435,7 @@ def cmd_doctor(args) -> None:
 
     report: dict = {"project": proj, "checks": {}}
     home = os.path.expanduser("~")
-    report["checks"]["persistent_location"] = proj.startswith(home)
+    report["checks"]["persistent_location"] = under_home(proj, home)
     report["checks"]["arch"] = platform.machine() or "unknown"
     geteuid = getattr(os, "geteuid", None)
     report["checks"]["root"] = (geteuid() == 0) if geteuid else None
@@ -1313,9 +1546,18 @@ def cloudflared_asset() -> str:
     return asset
 
 
+def cloudflared_download_url() -> str:
+    explicit = os.environ.get("CFBRIDGE_CLOUDFLARED_URL")
+    if explicit:
+        return explicit
+    version = (os.environ.get("CFBRIDGE_CLOUDFLARED_VERSION") or CLOUDFLARED_VERSION).strip()
+    if version.lower() == "latest":
+        return LATEST_RELEASE_URL.format(asset=cloudflared_asset())
+    return RELEASE_URL.format(version=version, asset=cloudflared_asset())
+
+
 def download_cloudflared(dst: str) -> str:
-    version = os.environ.get("CFBRIDGE_CLOUDFLARED_VERSION", CLOUDFLARED_VERSION)
-    url = os.environ.get("CFBRIDGE_CLOUDFLARED_URL") or RELEASE_URL.format(version=version, asset=cloudflared_asset())
+    url = cloudflared_download_url()
     expected = (os.environ.get("CFBRIDGE_CLOUDFLARED_SHA256") or "").lower()
     print(f"cloudflared not found locally; downloading {url}")
     tmp = dst + ".part"
@@ -1364,6 +1606,13 @@ def download_cloudflared(dst: str) -> str:
 
 def ensure_cloudflared(proj: str) -> str:
     dst = os.path.join(proj, "bin", "cloudflared")
+    if os.path.exists(dst) and not cloudflared_version(dst):
+        # A truncated copy (disk full mid-download, a bad sync) must not
+        # block the repair it is the subject of. Keep it for forensics
+        # and fetch a fresh one.
+        broken = dst + ".broken"
+        os.replace(dst, broken)
+        print(f"{dst} does not run; moved it to {broken} and reinstalling")
     if not os.path.exists(dst):
         os.makedirs(os.path.join(proj, "bin"), exist_ok=True)
         src = shutil.which("cloudflared")
@@ -1374,15 +1623,17 @@ def ensure_cloudflared(proj: str) -> str:
             download_cloudflared(dst)
     version = cloudflared_version(dst)
     if not version:
-        die(f"{dst} does not run (bad architecture or corrupt copy); remove it and re-run")
+        die(f"{dst} does not run (bad architecture or corrupt copy); "
+            "set CFBRIDGE_CLOUDFLARED_ASSET / CFBRIDGE_CLOUDFLARED_URL for this machine")
     print(f"cloudflared ready: {version}")
     return dst
 
 
 def cmd_init(args) -> None:
     proj = project_dir(args)
-    if not proj.startswith(os.path.expanduser("~")):
+    if not under_home(proj):
         print(f"warning: {proj} is outside $HOME; container rebuilds may wipe it", file=sys.stderr)
+    require_safe_path("project path", proj)
     ensure_project_layout(proj)
     binary = ensure_cloudflared(proj)
     key_path = os.path.join(proj, "secrets", "bridge-key.txt")
@@ -1496,6 +1747,13 @@ def validate_service(cfg: dict, svc: dict, allow_public: bool) -> None:
         val = svc.get(field) or ""
         if "\n" in val or "\r" in val:
             die(f"{field} must not contain newlines")
+    if svc.get("start_cmd"):
+        exe = start_cmd_executable(expand_start_cmd(svc["start_cmd"]))
+        if not exe:
+            die("start_cmd is empty")
+        if "/" in exe and not os.path.isabs(exe):
+            die(f"start_cmd executable {exe!r} must be an absolute path "
+                "(systemd's ExecStart= does not resolve relative paths)")
     origin = (svc.get("origin") or "").strip()
     if origin and not origin.startswith(ORIGIN_SCHEMES):
         die(f"origin must start with one of {', '.join(ORIGIN_SCHEMES)}: {origin!r}")
@@ -1554,8 +1812,8 @@ def cmd_add_service(args) -> None:
         "public_confirmed": bool(args.auth == "public" and args.allow_public),
         "origin": origin,
         "origin_request": parse_origin_request(args.origin_request),
-        "start_cmd": args.start_cmd or "",
-        "workdir": args.workdir or proj,
+        "start_cmd": expand_start_cmd((args.start_cmd or "").strip()),
+        "workdir": os.path.expanduser(args.workdir) if args.workdir else proj,
         "env_proxy": bool(args.env_proxy),
     }
     if origin.startswith(RAW_TCP_ORIGIN_SCHEMES):
@@ -1588,6 +1846,13 @@ def cmd_add_service(args) -> None:
     save_config(proj, cfg)
     shown = cf_api.service_origin(svc)
     print(f"registered {args.name}: {args.hostname} -> {shown} (auth={args.auth})")
+    if args.auth == "key":
+        print("note: auth=key is enforced by YOUR origin (it must check the X-Bridge-Key "
+              "header); cfbridge does not block unauthenticated requests. A service that "
+              "does not check it is open to anyone with the URL — use Cloudflare Access "
+              "for edge-side auth.")
+    if "$" in svc["start_cmd"]:
+        print("note: systemd expands $VAR / ${VAR} in start_cmd; write $$ for a literal $")
     if svc.get("origin_request"):
         print(f"originRequest: {json.dumps(svc['origin_request'], ensure_ascii=False)}")
     if svc.get("tcp_origin_confirmed"):
@@ -1647,6 +1912,9 @@ def ensure_tunnel_stack(proj: str, cfg: dict, force_dns: bool = False) -> tuple[
         cfg["account_id"] = account_id
     tun = cf_api.ensure_tunnel(account_id, cfg["tunnel_name"])
     tunnel_id = tun["id"]
+    # A tunnel this project used before (recreated after a manual
+    # delete, say) still owns its old records; nothing else does.
+    prior = [cfg["tunnel_id"]] if cfg.get("tunnel_id") and cfg["tunnel_id"] != tunnel_id else []
     if cfg.get("tunnel_id") != tunnel_id:
         cfg["tunnel_id"] = tunnel_id
     write_secret(proj, "tunnel-token.txt", tun["token"])
@@ -1654,7 +1922,8 @@ def ensure_tunnel_stack(proj: str, cfg: dict, force_dns: bool = False) -> tuple[
     cf_api.set_ingress(account_id, tunnel_id, cfg["services"])
     for s in cfg["services"]:
         res = cf_api.ensure_dns(zone["id"], s["hostname"], tunnel_id,
-                                allow_overwrite=bool(force_dns or cfg.get("force_dns")))
+                                allow_overwrite=bool(force_dns or cfg.get("force_dns")),
+                                prior_tunnel_ids=prior)
         print(f"dns {s['hostname']}: {res}")
     save_config(proj, cfg)
     print(f"tunnel {cfg['tunnel_name']} ({tunnel_id}) ingress for {len(cfg['services'])} service(s)")
@@ -1687,6 +1956,8 @@ def unit_names(proj: str, cfg: dict, mode: str) -> dict[str, str]:
 
 
 def render_units(proj: str, cfg: dict, mode: str) -> list[str]:
+    require_safe_path("project path", proj)
+    require_safe_path("skill path", HERE)
     names = unit_names(proj, cfg, mode)
     out_dir = os.path.join(proj, "systemd")
     os.makedirs(out_dir, exist_ok=True)
@@ -1723,8 +1994,8 @@ def render_units(proj: str, cfg: dict, mode: str) -> list[str]:
             "SERVICE_NAME": s["name"],
             "SERVICE_HOSTNAME": s["hostname"],
             "SERVICE_PORT": str(s["port"]),
-            "SERVICE_WORKDIR": s.get("workdir") or proj,
-            "SERVICE_START_CMD": s["start_cmd"],
+            "SERVICE_WORKDIR": systemd_escape_specifiers(os.path.expanduser(s.get("workdir") or proj)),
+            "SERVICE_START_CMD": systemd_escape_specifiers(expand_start_cmd(s["start_cmd"])),
             "SERVICE_ENVFILE": (f"EnvironmentFile=-{proj}/secrets/proxy.env" if s.get("env_proxy") else ""),
         })
         p = os.path.join(out_dir, uname + ".service")
@@ -1807,6 +2078,8 @@ def cmd_up(args) -> None:
     if not cfg["services"]:
         die("no services registered; use add-service or demo first")
     require_root("cfbridge up")
+    if clear_stopped(proj):
+        print("note: cleared the `cfbridge down` marker; the keepalive hook guards this stack again")
     normalized = False
     for s in cfg["services"]:
         normalized = normalize_origin(s) or normalized
@@ -1861,7 +2134,7 @@ def wait_local_health(cfg: dict, timeout: int = 45) -> None:
             if s["name"] not in pending:
                 continue
             try:
-                status, _ = http_get(f"http://127.0.0.1:{s['port']}{s.get('health', '/health')}", timeout=3)
+                status, _ = local_get(s["port"], s.get("health", "/health"), timeout=3)
                 if status == 200:
                     pending.discard(s["name"])
             except Exception:  # noqa: BLE001
@@ -1878,11 +2151,16 @@ def cmd_down(args) -> None:
     if not os.path.exists(units_file):
         die("no managed units recorded; nothing to stop")
     require_root("cfbridge down")
+    # Marker first: the keepalive hook polls every minute and must not
+    # race us into restarting what is being stopped.
+    mark_stopped(proj)
     units = [l.strip() for l in open(units_file, encoding="utf-8") if l.strip()]
     systemctl("stop", *units)
     for u in units:
         systemctl("disable", "--quiet", u)
     print(f"stopped: {', '.join(units)} (tunnel + DNS kept; cfbridge teardown removes them)")
+    print(f"marked stopped ({STOPPED_MARKER}): the keepalive hook and doctor --fix leave it down "
+          "until the next `cfbridge up`")
 
 
 def cmd_status(args, quiet: bool = False) -> None:
@@ -1890,7 +2168,7 @@ def cmd_status(args, quiet: bool = False) -> None:
     cfg = load_config(proj)
     units_file = os.path.join(proj, "run", "managed-units.txt")
     units = [l.strip() for l in open(units_file, encoding="utf-8") if l.strip()] if os.path.exists(units_file) else []
-    report: dict = {"project": proj, "units": {}, "services": []}
+    report: dict = {"project": proj, "stopped": is_stopped(proj), "units": {}, "services": []}
     for u in units:
         report["units"][u] = systemctl("is-active", u).stdout.strip()
     for s in cfg["services"]:
@@ -1898,7 +2176,7 @@ def cmd_status(args, quiet: bool = False) -> None:
                  "auth": s.get("auth", "key")}
         health_path = s.get("health", "/health")
         try:
-            status, _ = http_get(f"http://127.0.0.1:{s['port']}{health_path}", timeout=4)
+            status, _ = local_get(s["port"], health_path, timeout=4)
             entry["local"] = str(status)
         except Exception as e:  # noqa: BLE001
             entry["local"] = f"fail ({type(e).__name__})"
@@ -1911,6 +2189,8 @@ def cmd_status(args, quiet: bool = False) -> None:
     if getattr(args, "json", False):
         print(json.dumps(report, indent=2, ensure_ascii=False))
         return
+    if report.get("stopped"):
+        print("stack: stopped on purpose (cfbridge down); `cfbridge up` brings it back")
     for u, state in report["units"].items():
         print(f"unit {u}: {state}")
     if not report["units"]:
@@ -2087,6 +2367,7 @@ def cmd_verify(args) -> None:
     key_path = os.path.join(proj, "secrets", "bridge-key.txt")
     key = open(key_path, encoding="utf-8").read().strip() if os.path.exists(key_path) else ""
     ok = True
+    auth_unchecked: list[str] = []
     for s in cfg["services"]:
         host = s["hostname"]
         health_path = s.get("health", "/health")
@@ -2098,6 +2379,8 @@ def cmd_verify(args) -> None:
             print(f"{s['name']}: public health FAILED ({e})")
             continue
         if not args.ws:
+            if s.get("auth", "key") == "key":
+                auth_unchecked.append(s["name"])
             continue
         if s.get("auth", "key") == "key" and not key:
             print(f"{s['name']}: no bridge key file; skip WS check")
@@ -2133,6 +2416,12 @@ def cmd_verify(args) -> None:
                 print(f"{s['name']}: WS without key NOT rejected ({e})")
         else:
             print(f"{s['name']}: auth=public, skipping WS auth checks")
+    if auth_unchecked:
+        # Public health alone says nothing about auth: auth=key is the
+        # origin's job and a plain HTTP service may not check anything.
+        print(f"note: auth NOT verified for {', '.join(auth_unchecked)} (auth=key is enforced by "
+              "the origin, not by cfbridge; `verify --ws` checks WS origins that follow the demo "
+              "protocol, anything else must be checked against the origin itself)")
     if not ok:
         raise SystemExit(1)
     print("verify: all checks passed")
@@ -2142,6 +2431,10 @@ def cmd_verify(args) -> None:
 
 def cmd_install_autostart(args) -> None:
     proj = project_dir(args)
+    # The path is pasted into a bash script that runs as root every
+    # minute: a quote, `$` or backtick in it would be code.
+    require_safe_path("project path", proj)
+    require_safe_path("skill path", HERE)
     slug = project_slug(proj)
     hook_id = f"cfb-{slug}-keepalive"
     script_path = os.path.expanduser(f"~/hooks/scripts/{hook_id}.sh")
@@ -2164,12 +2457,36 @@ def cmd_install_autostart(args) -> None:
           "restore if possible, never print secrets/.")
 
 
+def remove_unit_records(proj: str, units: list[str]) -> None:
+    """Forget the units, so nothing can reinstall them.
+
+    The keepalive hook reinstalls whatever run/managed-units.txt lists
+    from the copies in systemd/; leaving either behind after teardown
+    resurrects a cloudflared holding the token of a deleted tunnel.
+    """
+    for u in units:
+        try:
+            os.remove(os.path.join(proj, "systemd", u + ".service"))
+        except FileNotFoundError:
+            pass
+    try:
+        os.remove(os.path.join(proj, "run", "managed-units.txt"))
+    except FileNotFoundError:
+        pass
+    hook_id = f"cfb-{project_slug(proj)}-keepalive"
+    print(f"unit records removed (run/managed-units.txt, systemd/ copies); "
+          f"remove the keepalive hook too: hooks.remove {hook_id} "
+          f"(script ~/hooks/scripts/{hook_id}.sh)")
+
+
 def cmd_teardown(args) -> None:
     proj = project_dir(args)
     cfg = load_config(proj)
     units_file = os.path.join(proj, "run", "managed-units.txt")
     if os.path.exists(units_file):
         require_root("cfbridge teardown (removing units)")
+        # Same race as `down`: tell the keepalive hook first.
+        mark_stopped(proj)
         units = [l.strip() for l in open(units_file, encoding="utf-8") if l.strip()]
         systemctl("stop", *units)
         for u in units:
@@ -2179,6 +2496,7 @@ def cmd_teardown(args) -> None:
                 os.remove(dst)
         systemctl("daemon-reload")
         print(f"units removed: {', '.join(units)}")
+        remove_unit_records(proj, units)
     account_id = cfg.get("account_id")
     tunnel_id = cfg.get("tunnel_id")
     if account_id and tunnel_id:
@@ -2193,12 +2511,33 @@ def cmd_teardown(args) -> None:
     if args.purge_project:
         # Only ever delete what we would also have created: a project dir
         # under $HOME. A typo'd --project outside it is refused outright.
-        if not proj.startswith(os.path.expanduser("~/") ) or proj == os.path.expanduser("~"):
+        home = os.path.abspath(os.path.expanduser("~"))
+        if not under_home(proj, home) or os.path.abspath(proj) == home:
             die(f"refusing to purge {proj}: not a project directory under $HOME")
         if not os.path.exists(os.path.join(proj, "config.json")):
             die(f"refusing to purge {proj}: no config.json (not a cfbridge project)")
         shutil.rmtree(proj)
         print(f"project dir purged: {proj}")
+
+
+def cmd_sync_proxy(args) -> None:
+    """Write secrets/proxy.env from a proxy that was just probed.
+
+    The keepalive hook calls this every poll instead of copying its own
+    environment into the file unverified: a rotated-away value in the
+    hook's environment would otherwise clobber the one entry that still
+    works, every minute.
+    """
+    proj = project_dir(args)
+    url, source, ok, detail = resolve_proxy(proj, timeout=args.timeout)
+    if not url:
+        return
+    if not ok:
+        if not args.quiet:
+            print(f"proxy: no working proxy ({detail}); secrets/proxy.env left as is")
+        raise SystemExit(1)
+    if refresh_proxy_env(proj, url):
+        print(f"proxy.env refreshed ({redact_proxy(url)} via {source})")
 
 
 # ---------------------------------------------------------------- main
@@ -2276,6 +2615,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--quiet", action="store_true", help="only report through the exit code")
     p.add_argument("--json", action="store_true")
     p.set_defaults(fn=cmd_prune_logs)
+    p = sub.add_parser("sync-proxy",
+                       help="rewrite secrets/proxy.env from a proxy that answers (used by the hook)")
+    p.add_argument("--timeout", type=float, default=5)
+    p.add_argument("--quiet", action="store_true")
+    p.set_defaults(fn=cmd_sync_proxy)
     sub.add_parser("install-autostart").set_defaults(fn=cmd_install_autostart)
     p = sub.add_parser("teardown"); p.add_argument("--purge-project", action="store_true"); p.set_defaults(fn=cmd_teardown)
     return ap

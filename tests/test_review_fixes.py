@@ -732,12 +732,15 @@ class LowFindings(EnvGuard):
                                                  "websockets.http11")}
         sys.modules.update({"websockets": fake_ws, "websockets.datastructures": ds,
                             "websockets.http11": h11})
+        # No .pyc under templates/: CI's placeholder check reads every file there as UTF-8.
+        saved_dwb, sys.dont_write_bytecode = sys.dont_write_bytecode, True
         try:
             spec = importlib.util.spec_from_file_location(
                 "demo_origin_under_test", ROOT / "templates" / "demo_origin.py")
             demo = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(demo)
         finally:
+            sys.dont_write_bytecode = saved_dwb
             for k, v in saved.items():
                 if v is None:
                     sys.modules.pop(k, None)
